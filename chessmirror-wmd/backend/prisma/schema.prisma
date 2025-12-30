@@ -1,0 +1,103 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id        String   @id @default(uuid())
+  uid       String   @unique
+  createdAt DateTime @default(now())
+
+  tz        String?
+  lang      String?
+  userAgent String?
+  screenW   Int?
+  screenH   Int?
+
+  sessions  Session[]
+  games     Game[]
+  events    Event[]
+  profile   Profile?
+  decisions AdminDecision[]
+}
+
+model Session {
+  id        String   @id @default(uuid())
+  userId    String
+  startedAt DateTime @default(now())
+  endedAt   DateTime?
+  ipHash    String?
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  events    Event[]
+}
+
+model Event {
+  id        String   @id @default(uuid())
+  userId    String
+  sessionId String?
+  ts        DateTime @default(now())
+  type      String
+  payload   Json
+
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  session   Session? @relation(fields: [sessionId], references: [id], onDelete: SetNull)
+
+  @@index([userId, ts])
+  @@index([type, ts])
+}
+
+model Game {
+  id        String   @id @default(uuid())
+  userId    String
+  createdAt DateTime @default(now())
+  result    String?  // win/loss/draw/aborted
+
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  moves     Move[]
+}
+
+model Move {
+  id          String   @id @default(uuid())
+  gameId      String
+  ply         Int
+  san         String
+  uci         String
+  thinkTimeMs Int
+  quality     String   // good / blunder (heuristic)
+  createdAt   DateTime @default(now())
+
+  game        Game     @relation(fields: [gameId], references: [id], onDelete: Cascade)
+
+  @@index([gameId, ply])
+}
+
+model Profile {
+  id              String   @id @default(uuid())
+  userId          String   @unique
+  updatedAt       DateTime @updatedAt
+
+  moveCount       Int      @default(0)
+  blunderCount    Int      @default(0)
+  avgThinkTimeMs  Int      @default(0)
+  hintCount       Int      @default(0)
+
+  segment         String   @default("unknown") // impulsive / careful / learner / unknown
+
+  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model AdminDecision {
+  id        String   @id @default(uuid())
+  userId    String
+  createdAt DateTime @default(now())
+  interventions Json
+
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+}
