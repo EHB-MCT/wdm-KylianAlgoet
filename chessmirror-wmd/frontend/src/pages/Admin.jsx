@@ -1,5 +1,10 @@
 import React, { useEffect, useMemo, useState } from "react";
-import { adminGetEvents, adminGetProfile, adminListUsers, adminSetInterventions } from "../lib/api";
+import {
+  adminGetEvents,
+  adminGetProfile,
+  adminListUsers,
+  adminSetInterventions
+} from "../lib/api";
 import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer } from "recharts";
 
 function formatMs(ms) {
@@ -27,7 +32,7 @@ export default function Admin() {
       if (list?.error) throw new Error(list.error);
       localStorage.setItem("cm_admin_pw", adminPassword);
       setLoggedIn(true);
-      setUsers(list);
+      setUsers(Array.isArray(list) ? list : []);
     } catch (e) {
       setErr("Admin login failed. Check ADMIN_PASSWORD in .env");
       setLoggedIn(false);
@@ -42,14 +47,22 @@ export default function Admin() {
         setUsers(Array.isArray(list) ? list : []);
       } catch (e) {}
     })();
-  }, [loggedIn]);
+  }, [loggedIn, adminPassword]);
 
   async function selectUser(uid) {
     setSelectedUid(uid);
+
     const p = await adminGetProfile(uid, adminPassword);
     setProfile(p);
-    const ev = await adminGetEvents(uid, adminPassword, 120);
-    setEvents(ev);
+
+    // If backend already returns recentEvents inside profile, prefer that.
+    // Otherwise fall back to calling /events endpoint.
+    if (Array.isArray(p?.recentEvents)) {
+      setEvents(p.recentEvents);
+    } else {
+      const ev = await adminGetEvents(uid, adminPassword, 120);
+      setEvents(Array.isArray(ev) ? ev : []);
+    }
 
     // reset toggles to defaults (admin can change)
     setConfirmMoves(false);
@@ -65,6 +78,41 @@ export default function Admin() {
     alert("Saved. User app will pick this up on refresh.");
   }
 
+  // Build chart series (last moves)
+  const moveSeries = useMemo(() => {
+    return (profile?.moves || []).map((m, i) => ({
+      i,
+      thinkTimeMs: m.thinkTimeMs,
+      blunder: m.quality === "blunder" ? 1 : 0
+    }));
+  }, [profile]);
+
+  // Prefer new backend-provided stats/insight if present
+  const stats = profile?.stats || null;
+  const insight = profile?.insight || null;
+
+  // Segment: new insight-based segment if present, else db segment in profile.profile.segment
+  const segment = profile?.segment || profile?.profile?.segment || "unknown";
+
+  // Blunder rate: use stats if provided, else compute from db counters
+  const blunderRate = useMemo(() => {
+    if (typeof stats?.blunderRate === "number") return stats.blunderRate;
+
+    const moveCount = profile?.profile?.moveCount ?? 0;
+    const blunderCount = profile?.profile?.blunderCount ?? 0;
+    if (!moveCount) return 0;
+    return Math.round((blunderCount / moveCount) * 100);
+  }, [stats, profile]);
+
+  // Avg think: use stats.avgThinkTime (seconds) if present, else formatMs from profile.profile.avgThinkTimeMs
+  const avgThinkDisplay = useMemo(() => {
+    if (typeof stats?.avgThinkTime === "number") return `${stats.avgThinkTime}s`;
+    return formatMs(profile?.profile?.avgThinkTimeMs ?? 0);
+  }, [stats, profile]);
+
+  // Hover count: show if available
+  const hoverCount = typeof stats?.hoverCount === "number" ? stats.hoverCount : null;
+
   if (!loggedIn) {
     return (
       <div className="card">
@@ -78,37 +126,35 @@ export default function Admin() {
           type="password"
         />
         <div className="row" style={{ marginTop: 10 }}>
-          <button className="btn" onClick={login}>Login</button>
+          <button className="btn" onClick={login}>
+            Login
+          </button>
         </div>
-        {err && <p className="small" style={{ color: "#ff7b7b" }}>{err}</p>}
+        {err && (
+          <p className="small" style={{ color: "#ff7b7b" }}>
+            {err}
+          </p>
+        )}
       </div>
     );
   }
 
-  const moveSeries = (profile?.moves || []).map((m, i) => ({
-    i,
-    thinkTimeMs: m.thinkTimeMs,
-    blunder: m.quality === "blunder" ? 1 : 0
-  }));
-
-  const blunderRate = profile?.profile?.moveCount
-    ? Math.round((profile.profile.blunderCount / profile.profile.moveCount) * 100)
-    : 0;
-
   return (
     <div className="row" style={{ alignItems: "flex-start" }}>
+      {/* LEFT: USERS */}
       <div className="card" style={{ flex: "0 0 360px" }}>
         <h3 style={{ marginTop: 0 }}>Users</h3>
         <p className="small">Select a UID to view their profile and events.</p>
         <div style={{ maxHeight: 520, overflow: "auto" }}>
-          {users.map(u => (
+          {users.map((u) => (
             <div key={u.uid} style={{ padding: "10px 0", borderBottom: "1px solid #242532" }}>
               <div className="row" style={{ justifyContent: "space-between" }}>
                 <span className="badge">{u.uid}</span>
                 <span className="badge">{u.segment}</span>
               </div>
               <div className="small" style={{ marginTop: 6, opacity: 0.85 }}>
-                moves: {u.moveCount} • blunders: {u.blunderCount} • avg think: {formatMs(u.avgThinkTimeMs)} • hints: {u.hintCount}
+                moves: {u.moveCount} • blunders: {u.blunderCount} • avg think: {formatMs(u.avgThinkTimeMs)} • hints:{" "}
+                {u.hintCount}
               </div>
               <button className="btn" style={{ marginTop: 8 }} onClick={() => selectUser(u.uid)}>
                 Open
@@ -119,6 +165,7 @@ export default function Admin() {
         </div>
       </div>
 
+      {/* RIGHT: PROFILE */}
       <div className="card" style={{ flex: "1 1 520px" }}>
         {!selectedUid ? (
           <p className="small">Pick a user on the left.</p>
@@ -126,18 +173,38 @@ export default function Admin() {
           <>
             <div className="row" style={{ justifyContent: "space-between", alignItems: "center" }}>
               <h3 style={{ margin: 0 }}>Profile: {selectedUid}</h3>
-              <span className="badge">segment: {profile?.profile?.segment || "unknown"}</span>
+              <span className="badge">segment: {segment}</span>
             </div>
 
-            <div className="row" style={{ marginTop: 10 }}>
+            {/* QUICK STATS */}
+            <div className="row" style={{ marginTop: 10, flexWrap: "wrap" }}>
               <span className="badge">moves: {profile?.profile?.moveCount ?? 0}</span>
               <span className="badge">blunder rate: {blunderRate}%</span>
-              <span className="badge">avg think: {formatMs(profile?.profile?.avgThinkTimeMs ?? 0)}</span>
+              <span className="badge">avg think: {avgThinkDisplay}</span>
               <span className="badge">hints: {profile?.profile?.hintCount ?? 0}</span>
+              {hoverCount != null && <span className="badge">hovers: {hoverCount}</span>}
+            </div>
+
+            {/* NEW: CONCLUSION / INSIGHT */}
+            <div className="card" style={{ marginTop: 14 }}>
+              <h4 style={{ margin: "0 0 8px 0" }}>Conclusion</h4>
+              <p className="small" style={{ margin: 0, opacity: 0.9 }}>
+                <strong>{insight?.label ?? "—"}</strong>{" "}
+                {insight?.text ??
+                  "No insight yet. Play a few moves and interact with the UI (hover / hints) to generate signals."}
+              </p>
+
+              {stats && (
+                <p className="small" style={{ marginTop: 8, opacity: 0.7 }}>
+                  Signals: avgThink={stats.avgThinkTime ?? "—"}s · blunderRate={stats.blunderRate ?? "—"}% · hovers=
+                  {stats.hoverCount ?? "—"}
+                </p>
+              )}
             </div>
 
             <hr />
 
+            {/* CHART */}
             <h4 style={{ margin: "0 0 8px 0" }}>Think time trend (last moves)</h4>
             <div style={{ width: "100%", height: 220 }}>
               <ResponsiveContainer>
@@ -152,37 +219,43 @@ export default function Admin() {
 
             <hr />
 
+            {/* INTERVENTIONS */}
             <h4 style={{ margin: "0 0 8px 0" }}>Interventions (influence)</h4>
             <p className="small">These toggles change the user-facing UI for this UID.</p>
-            <div className="row">
+            <div className="row" style={{ flexWrap: "wrap" }}>
               <label className="small">
-                <input type="checkbox" checked={confirmMoves} onChange={(e) => setConfirmMoves(e.target.checked)} />
-                {" "}confirmMoves (adds confirm prompt)
+                <input type="checkbox" checked={confirmMoves} onChange={(e) => setConfirmMoves(e.target.checked)} />{" "}
+                confirmMoves (adds confirm prompt)
               </label>
               <label className="small">
-                <input type="checkbox" checked={nudgeTakeASecond} onChange={(e) => setNudgeTakeASecond(e.target.checked)} />
-                {" "}nudgeTakeASecond (shows nudge text)
+                <input type="checkbox" checked={nudgeTakeASecond} onChange={(e) => setNudgeTakeASecond(e.target.checked)} />{" "}
+                nudgeTakeASecond (shows nudge text)
               </label>
             </div>
             <div className="row" style={{ marginTop: 10 }}>
-              <button className="btn" onClick={saveInterventions}>Save interventions</button>
+              <button className="btn" onClick={saveInterventions}>
+                Save interventions
+              </button>
             </div>
 
             <hr />
 
+            {/* EVENTS */}
             <h4 style={{ margin: "0 0 8px 0" }}>Recent events (sample)</h4>
             <div style={{ maxHeight: 220, overflow: "auto", fontSize: 12 }}>
-              {Array.isArray(events) && events.map(ev => (
-                <div key={ev.id} style={{ padding: "8px 0", borderBottom: "1px solid #242532" }}>
-                  <div className="row" style={{ justifyContent: "space-between" }}>
-                    <span className="badge">{ev.type}</span>
-                    <span className="small">{new Date(ev.ts).toLocaleString()}</span>
+              {Array.isArray(events) &&
+                events.map((ev) => (
+                  <div key={ev.id} style={{ padding: "8px 0", borderBottom: "1px solid #242532" }}>
+                    <div className="row" style={{ justifyContent: "space-between" }}>
+                      <span className="badge">{ev.type}</span>
+                      <span className="small">{new Date(ev.ts).toLocaleString()}</span>
+                    </div>
+                    <pre style={{ whiteSpace: "pre-wrap", margin: "6px 0 0 0", opacity: 0.9 }}>
+                      {JSON.stringify(ev.payload, null, 2)}
+                    </pre>
                   </div>
-                  <pre style={{ whiteSpace: "pre-wrap", margin: "6px 0 0 0", opacity: 0.9 }}>
-{JSON.stringify(ev.payload, null, 2)}
-                  </pre>
-                </div>
-              ))}
+                ))}
+              {(!events || events.length === 0) && <p className="small">No recent events to show.</p>}
             </div>
           </>
         )}
