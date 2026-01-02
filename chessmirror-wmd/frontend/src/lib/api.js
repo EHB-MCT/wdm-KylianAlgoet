@@ -1,62 +1,124 @@
 const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:3001";
 
+async function safeJson(res) {
+  const text = await res.text();
+  try {
+    return text ? JSON.parse(text) : {};
+  } catch {
+    return { raw: text };
+  }
+}
+
+async function request(path, opts = {}) {
+  const res = await fetch(`${API_BASE}${path}`, {
+    // important defaults
+    mode: "cors",
+    credentials: "omit",
+    ...opts,
+  });
+
+  const data = await safeJson(res);
+
+  if (!res.ok) {
+    const msg =
+      data?.error ||
+      data?.message ||
+      `HTTP ${res.status} ${res.statusText} on ${path}`;
+    const err = new Error(msg);
+    err.status = res.status;
+    err.data = data;
+    throw err;
+  }
+
+  return data;
+}
+
 export async function postEvent(event) {
-  await fetch(`${API_BASE}/api/track/event`, {
+  // events can be fire-and-forget, but still avoid caching weirdness
+  return request("/api/track/event", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
+    cache: "no-store",
     body: JSON.stringify(event),
   });
 }
 
 export async function startGame(uid) {
-  const res = await fetch(`${API_BASE}/api/game/start`, {
+  // IMPORTANT: no-store so dev caching can't cause weirdness
+  return request("/api/game/start", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
+    cache: "no-store",
     body: JSON.stringify({ uid }),
   });
-  return res.json();
 }
 
 export async function submitMove(payload) {
-  const res = await fetch(`${API_BASE}/api/game/move`, {
+  return request("/api/game/move", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
+    cache: "no-store",
     body: JSON.stringify(payload),
   });
-  return res.json();
 }
 
 export async function getInterventions(uid) {
-  const res = await fetch(`${API_BASE}/api/interventions/${uid}`);
-  return res.json();
+  // cache-bust (some browsers keep GET cached aggressively in dev)
+  const t = Date.now();
+  return request(`/api/interventions/${encodeURIComponent(uid)}?t=${t}`, {
+    method: "GET",
+    cache: "no-store",
+    headers: { "Cache-Control": "no-store" },
+  });
 }
 
 export async function adminListUsers(adminPassword) {
-  const res = await fetch(`${API_BASE}/api/admin/users`, {
-    headers: { "x-admin-password": adminPassword }
+  const t = Date.now();
+  return request(`/api/admin/users?t=${t}`, {
+    method: "GET",
+    cache: "no-store",
+    headers: {
+      "x-admin-password": adminPassword,
+      "Cache-Control": "no-store",
+    },
   });
-  return res.json();
 }
 
 export async function adminGetProfile(uid, adminPassword) {
-  const res = await fetch(`${API_BASE}/api/admin/users/${uid}/profile`, {
-    headers: { "x-admin-password": adminPassword }
+  const t = Date.now();
+  return request(`/api/admin/users/${encodeURIComponent(uid)}/profile?t=${t}`, {
+    method: "GET",
+    cache: "no-store",
+    headers: {
+      "x-admin-password": adminPassword,
+      "Cache-Control": "no-store",
+    },
   });
-  return res.json();
 }
 
-export async function adminGetEvents(uid, adminPassword, take=200) {
-  const res = await fetch(`${API_BASE}/api/admin/users/${uid}/events?take=${take}`, {
-    headers: { "x-admin-password": adminPassword }
-  });
-  return res.json();
+export async function adminGetEvents(uid, adminPassword, take = 200) {
+  const t = Date.now();
+  return request(
+    `/api/admin/users/${encodeURIComponent(uid)}/events?take=${take}&t=${t}`,
+    {
+      method: "GET",
+      cache: "no-store",
+      headers: {
+        "x-admin-password": adminPassword,
+        "Cache-Control": "no-store",
+      },
+    }
+  );
 }
 
 export async function adminSetInterventions(uid, adminPassword, interventions) {
-  const res = await fetch(`${API_BASE}/api/admin/users/${uid}/interventions`, {
+  return request(`/api/admin/users/${encodeURIComponent(uid)}/interventions`, {
     method: "POST",
-    headers: { "Content-Type":"application/json", "x-admin-password": adminPassword },
-    body: JSON.stringify({ interventions })
+    cache: "no-store",
+    headers: {
+      "Content-Type": "application/json",
+      "x-admin-password": adminPassword,
+    },
+    body: JSON.stringify({ interventions }),
   });
-  return res.json();
 }

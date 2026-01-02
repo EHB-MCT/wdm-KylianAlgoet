@@ -10,52 +10,109 @@ import { getBehaviorInsight } from "./analysis/behaviorInsight.js";
 
 export const router = express.Router();
 
-async function upsertUserFromEvent(e) {
-  const user = await prisma.user.upsert({
-    where: { uid: e.uid },
-    update: {
-      tz: e.meta?.tz,
-      lang: e.meta?.lang,
-      userAgent: e.meta?.userAgent?.slice(0, 256),
-      screenW: e.meta?.screenW,
-      screenH: e.meta?.screenH,
-    },
-    create: {
-      uid: e.uid,
-      tz: e.meta?.tz,
-      lang: e.meta?.lang,
-      userAgent: e.meta?.userAgent?.slice(0, 256),
-      screenW: e.meta?.screenW,
-      screenH: e.meta?.screenH,
-      profile: { create: {} },
-    },
-    include: { profile: true },
-  });
+/**
+ * HARD FIX: Race-safe user+profile creation.
+ * - Upsert user by uid
+ * - Ensure profile with createMany(skipDuplicates) => never throws, never aborts tx
+ * - Always return user with profile included
+ */
+async function getOrCreateUser(uid, meta = {}) {
+  return prisma.$transaction(async (tx) => {
+    // 1) Create user if missing (race-safe)
+    await tx.user.createMany({
+      data: [
+        {
+          uid,
+          tz: meta?.tz,
+          lang: meta?.lang,
+          userAgent: meta?.userAgent?.slice(0, 256),
+          screenW: meta?.screenW,
+          screenH: meta?.screenH,
+        },
+      ],
+      skipDuplicates: true,
+    });
 
-  const session = await prisma.session.upsert({
-    where: { id: e.sessionId },
-    update: {},
-    create: {
-      id: e.sessionId,
-      userId: user.id,
-      ipHash: hashIp(e.ip),
-    },
-  });
+    // 2) Always update meta (safe, user exists after createMany)
+    await tx.user.update({
+      where: { uid },
+      data: {
+        tz: meta?.tz,
+        lang: meta?.lang,
+        userAgent: meta?.userAgent?.slice(0, 256),
+        screenW: meta?.screenW,
+        screenH: meta?.screenH,
+      },
+    });
 
-  return { user, session };
+    // 3) Read user (need id)
+    const user = await tx.user.findUnique({ where: { uid } });
+    if (!user) throw new Error("User not found after createMany");
+
+    // 4) Ensure profile exists (race-safe)
+    await tx.profile.createMany({
+      data: [{ userId: user.id }],
+      skipDuplicates: true,
+    });
+
+    // 5) Return fresh user + profile
+    return tx.user.findUnique({
+      where: { uid },
+      include: { profile: true },
+    });
+  });
 }
 
-// Track micro-events
+async function ensureProfile(userId) {
+  // Never throws on duplicates
+  await prisma.profile.createMany({
+    data: [{ userId }],
+    skipDuplicates: true,
+  });
+
+  return prisma.profile.findUnique({ where: { userId } });
+}
+
+async function safeUserByUid(uid) {
+  const user = await prisma.user.findUnique({
+    where: { uid },
+    include: { profile: true },
+  });
+  if (!user) return null;
+
+  if (!user.profile) {
+    user.profile = await ensureProfile(user.id);
+  }
+  return user;
+}
+
+async function upsertSessionForEvent(userId, sessionId, ip) {
+  return prisma.session.upsert({
+    where: { id: sessionId },
+    update: {},
+    create: {
+      id: sessionId,
+      userId,
+      ipHash: hashIp(ip),
+    },
+  });
+}
+
+// ===== Track micro-events =====
 router.post("/track/event", validateEvent, async (req, res) => {
   try {
     const e = req.cleanedEvent;
-    e.ip =
+
+    const ip =
       req.headers["x-forwarded-for"]?.toString().split(",")[0]?.trim() ||
-      req.socket.remoteAddress;
+      req.socket.remoteAddress ||
+      "unknown";
 
-    const { user, session } = await upsertUserFromEvent(e);
+    const user = await getOrCreateUser(e.uid, e.meta);
+    if (!user) return res.status(500).json({ error: "User create failed" });
 
-    // Store event
+    const session = await upsertSessionForEvent(user.id, e.sessionId, ip);
+
     await prisma.event.create({
       data: {
         userId: user.id,
@@ -66,11 +123,8 @@ router.post("/track/event", validateEvent, async (req, res) => {
       },
     });
 
-    // Increment hintCount when relevant
     if (e.type === "hint_used") {
-      const profile = await prisma.profile.findUnique({
-        where: { userId: user.id },
-      });
+      const profile = user.profile ?? (await ensureProfile(user.id));
       const next = (profile?.hintCount ?? 0) + 1;
 
       const updated = await prisma.profile.update({
@@ -87,27 +141,30 @@ router.post("/track/event", validateEvent, async (req, res) => {
     res.json({ ok: true });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: "Server error" });
+    res.status(500).json({ error: "Server error", code: err?.code });
   }
 });
 
-// Start a new game for a user
+// ===== Game start =====
 router.post("/game/start", async (req, res) => {
-  const { uid } = req.body || {};
-  if (!uid || typeof uid !== "string")
-    return res.status(400).json({ error: "uid required" });
+  try {
+    const { uid, meta } = req.body || {};
+    if (!uid || typeof uid !== "string") {
+      return res.status(400).json({ error: "uid required" });
+    }
 
-  const user = await prisma.user.upsert({
-    where: { uid },
-    update: {},
-    create: { uid, profile: { create: {} } },
-  });
+    const user = await getOrCreateUser(uid, meta || {});
+    if (!user) return res.status(500).json({ error: "User create failed" });
 
-  const game = await prisma.game.create({ data: { userId: user.id } });
-  res.json({ gameId: game.id });
+    const game = await prisma.game.create({ data: { userId: user.id } });
+    return res.json({ gameId: game.id });
+  } catch (err) {
+    console.error("START ERROR:", err);
+    return res.status(500).json({ error: "Server error", code: err?.code });
+  }
 });
 
-// Submit a move + think time + FEN before move (so backend can evaluate)
+// ===== Submit move =====
 router.post("/game/move", async (req, res) => {
   try {
     const { uid, gameId, fenBefore, uci, san, ply, thinkTimeMs } = req.body || {};
@@ -115,13 +172,9 @@ router.post("/game/move", async (req, res) => {
       return res.status(400).json({ error: "Missing fields" });
     }
 
-    const user = await prisma.user.findUnique({
-      where: { uid },
-      include: { profile: true },
-    });
+    const user = await safeUserByUid(uid);
     if (!user) return res.status(404).json({ error: "Unknown uid" });
 
-    // Move quality heuristic
     const chess = new Chess(fenBefore);
     const move = chess.move(
       {
@@ -132,9 +185,12 @@ router.post("/game/move", async (req, res) => {
       { sloppy: true }
     );
 
+    if (!move) {
+      return res.status(400).json({ error: "Illegal/invalid move" });
+    }
+
     const quality = labelMoveQuality(chess, move);
 
-    // Store move
     await prisma.move.create({
       data: {
         gameId,
@@ -146,16 +202,16 @@ router.post("/game/move", async (req, res) => {
       },
     });
 
-    // Update profile aggregates
-    const prev =
-      user.profile ?? (await prisma.profile.create({ data: { userId: user.id } }));
+    const prev = user.profile ?? (await ensureProfile(user.id));
 
-    const moveCount = prev.moveCount + 1;
-    const blunderCount = prev.blunderCount + (quality === "blunder" ? 1 : 0);
+    const moveCount = (prev?.moveCount ?? 0) + 1;
+    const blunderCount = (prev?.blunderCount ?? 0) + (quality === "blunder" ? 1 : 0);
 
-    // incremental avg
+    const prevMoveCount = prev?.moveCount ?? 0;
+    const prevAvg = prev?.avgThinkTimeMs ?? 0;
+
     const avgThinkTimeMs = Math.round(
-      (prev.avgThinkTimeMs * prev.moveCount + (thinkTimeMs ?? 0)) / moveCount
+      (prevAvg * prevMoveCount + (thinkTimeMs ?? 0)) / moveCount
     );
 
     const updated = await prisma.profile.update({
@@ -171,166 +227,178 @@ router.post("/game/move", async (req, res) => {
     res.json({ ok: true, quality });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: "Server error" });
+    res.status(500).json({ error: "Server error", code: err?.code });
   }
 });
 
 // ===== Admin routes =====
 router.get("/admin/users", adminAuth, async (req, res) => {
-  const users = await prisma.user.findMany({
-    orderBy: { createdAt: "desc" },
-    include: { profile: true },
-  });
+  try {
+    const users = await prisma.user.findMany({
+      orderBy: { createdAt: "desc" },
+      include: { profile: true },
+    });
 
-  res.json(
-    users.map((u) => ({
-      uid: u.uid,
-      createdAt: u.createdAt,
-      segment: u.profile?.segment ?? "unknown",
-      moveCount: u.profile?.moveCount ?? 0,
-      blunderCount: u.profile?.blunderCount ?? 0,
-      avgThinkTimeMs: u.profile?.avgThinkTimeMs ?? 0,
-      hintCount: u.profile?.hintCount ?? 0,
-    }))
-  );
+    res.json(
+      users.map((u) => ({
+        uid: u.uid,
+        createdAt: u.createdAt,
+        segment: u.profile?.segment ?? "unknown",
+        moveCount: u.profile?.moveCount ?? 0,
+        blunderCount: u.profile?.blunderCount ?? 0,
+        avgThinkTimeMs: u.profile?.avgThinkTimeMs ?? 0,
+        hintCount: u.profile?.hintCount ?? 0,
+      }))
+    );
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
 });
 
 router.get("/admin/users/:uid/profile", adminAuth, async (req, res) => {
-  const uid = req.params.uid;
+  try {
+    const uid = req.params.uid;
 
-  const user = await prisma.user.findUnique({
-    where: { uid },
-    include: { profile: true },
-  });
-  if (!user) return res.status(404).json({ error: "Not found" });
-
-  // ✅ FIX 1: ensure profile exists so we can safely spread + read fields
-  if (!user.profile) {
-    user.profile = await prisma.profile.create({ data: { userId: user.id } });
-  }
-
-  // trend data: last 200 moves
-  const games = await prisma.game.findMany({
-    where: { userId: user.id },
-    orderBy: { createdAt: "desc" },
-    take: 20,
-    include: { moves: { orderBy: { ply: "asc" }, take: 200 } },
-  });
-
-  const flatMoves = games
-    .flatMap((g) =>
-      g.moves.map((m) => ({
-        gameId: g.id,
-        ply: m.ply,
-        thinkTimeMs: m.thinkTimeMs,
-        quality: m.quality,
-        createdAt: m.createdAt,
-      }))
-    )
-    .slice(-200);
-
-  // recent events (sample) + hoverCount
-  const events = await prisma.event.findMany({
-    where: { userId: user.id },
-    orderBy: { ts: "desc" },
-    take: 200,
-  });
-
-  const hoverCount = events.filter((e) => e.type === "hover").length;
-
-  const moveCount = user.profile.moveCount ?? 0;
-  const blunderCount = user.profile.blunderCount ?? 0;
-  const avgThinkTimeMs = user.profile.avgThinkTimeMs ?? 0;
-
-  const blunderRate = moveCount > 0 ? Math.round((blunderCount / moveCount) * 100) : 0;
-
-  const stats = {
-    avgThinkTime: Math.round((avgThinkTimeMs / 1000) * 10) / 10, // seconds (1 dec)
-    blunderRate,
-    hoverCount,
-  };
-
-  const insight = getBehaviorInsight(stats);
-  const segment = insight.label;
-
-  // ✅ FIX 2: persist computed segment (Optie B) (profile guaranteed now)
-  if (user.profile.segment !== segment) {
-    user.profile = await prisma.profile.update({
-      where: { userId: user.id },
-      data: { segment },
+    const user = await prisma.user.findUnique({
+      where: { uid },
+      include: { profile: true },
     });
-  }
+    if (!user) return res.status(404).json({ error: "Not found" });
 
-  res.json({
-    uid: user.uid,
-    createdAt: user.createdAt,
-    meta: {
-      tz: user.tz,
-      lang: user.lang,
-      userAgent: user.userAgent,
-      screenW: user.screenW,
-      screenH: user.screenH,
-    },
+    let profile = user.profile;
+    if (!profile) profile = await ensureProfile(user.id);
 
-    // keep backward compatibility for frontend
-    profile: {
-      ...user.profile,
+    const games = await prisma.game.findMany({
+      where: { userId: user.id },
+      orderBy: { createdAt: "desc" },
+      take: 20,
+      include: { moves: { orderBy: { ply: "asc" }, take: 200 } },
+    });
+
+    const flatMoves = games
+      .flatMap((g) =>
+        g.moves.map((m) => ({
+          gameId: g.id,
+          ply: m.ply,
+          thinkTimeMs: m.thinkTimeMs,
+          quality: m.quality,
+          createdAt: m.createdAt,
+        }))
+      )
+      .slice(-200);
+
+    const events = await prisma.event.findMany({
+      where: { userId: user.id },
+      orderBy: { ts: "desc" },
+      take: 200,
+    });
+
+    const hoverCount = events.filter((e) => e.type === "hover").length;
+
+    const moveCount = profile?.moveCount ?? 0;
+    const blunderCount = profile?.blunderCount ?? 0;
+    const avgThinkTimeMs = profile?.avgThinkTimeMs ?? 0;
+
+    const blunderRate = moveCount > 0 ? Math.round((blunderCount / moveCount) * 100) : 0;
+
+    const stats = {
+      avgThinkTime: Math.round((avgThinkTimeMs / 1000) * 10) / 10,
+      blunderRate,
+      hoverCount,
+    };
+
+    const insight = getBehaviorInsight(stats);
+    const segment = insight.label;
+
+    if (profile?.segment !== segment) {
+      profile = await prisma.profile.update({
+        where: { userId: user.id },
+        data: { segment },
+      });
+    }
+
+    res.json({
+      uid: user.uid,
+      createdAt: user.createdAt,
+      meta: {
+        tz: user.tz,
+        lang: user.lang,
+        userAgent: user.userAgent,
+        screenW: user.screenW,
+        screenH: user.screenH,
+      },
+      profile: {
+        ...profile,
+        segment,
+      },
       segment,
-    },
-
-    // NEW: insight + segment + extra metrics
-    segment,
-    insight,
-    stats,
-
-    moves: flatMoves,
-
-    // OPTIONAL: show sample events in admin profile response
-    recentEvents: events.slice(0, 25),
-  });
+      insight,
+      stats,
+      moves: flatMoves,
+      recentEvents: events.slice(0, 25),
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
 });
 
 router.get("/admin/users/:uid/events", adminAuth, async (req, res) => {
-  const uid = req.params.uid;
-  const user = await prisma.user.findUnique({ where: { uid } });
-  if (!user) return res.status(404).json({ error: "Not found" });
+  try {
+    const uid = req.params.uid;
+    const user = await prisma.user.findUnique({ where: { uid } });
+    if (!user) return res.status(404).json({ error: "Not found" });
 
-  const take = Math.min(500, Math.max(1, parseInt(req.query.take ?? "200", 10)));
-  const events = await prisma.event.findMany({
-    where: { userId: user.id },
-    orderBy: { ts: "desc" },
-    take,
-  });
+    const take = Math.min(500, Math.max(1, parseInt(req.query.take ?? "200", 10)));
+    const events = await prisma.event.findMany({
+      where: { userId: user.id },
+      orderBy: { ts: "desc" },
+      take,
+    });
 
-  res.json(events);
+    res.json(events);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
 });
 
 router.post("/admin/users/:uid/interventions", adminAuth, async (req, res) => {
-  const uid = req.params.uid;
-  const user = await prisma.user.findUnique({ where: { uid } });
-  if (!user) return res.status(404).json({ error: "Not found" });
+  try {
+    const uid = req.params.uid;
+    const user = await prisma.user.findUnique({ where: { uid } });
+    if (!user) return res.status(404).json({ error: "Not found" });
 
-  const interventions = req.body?.interventions ?? {};
-  const decision = await prisma.adminDecision.create({
-    data: {
-      userId: user.id,
-      interventions,
-    },
-  });
+    const interventions = req.body?.interventions ?? {};
+    const decision = await prisma.adminDecision.create({
+      data: {
+        userId: user.id,
+        interventions,
+      },
+    });
 
-  res.json({ ok: true, decisionId: decision.id });
+    res.json({ ok: true, decisionId: decision.id });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
 });
 
 router.get("/interventions/:uid", async (req, res) => {
-  // user-facing fetch (no admin password): last decision for uid
-  const uid = req.params.uid;
-  const user = await prisma.user.findUnique({ where: { uid } });
-  if (!user) return res.json({ interventions: {} });
+  try {
+    const uid = req.params.uid;
+    const user = await prisma.user.findUnique({ where: { uid } });
+    if (!user) return res.json({ interventions: {} });
 
-  const last = await prisma.adminDecision.findFirst({
-    where: { userId: user.id },
-    orderBy: { createdAt: "desc" },
-  });
+    const last = await prisma.adminDecision.findFirst({
+      where: { userId: user.id },
+      orderBy: { createdAt: "desc" },
+    });
 
-  res.json({ interventions: last?.interventions ?? {} });
+    res.json({ interventions: last?.interventions ?? {} });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
 });

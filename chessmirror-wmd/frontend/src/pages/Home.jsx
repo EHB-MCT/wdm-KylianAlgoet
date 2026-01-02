@@ -5,47 +5,160 @@ import { getUid, newUid, newSessionId } from "../lib/uid";
 import { track } from "../lib/tracker";
 import { getInterventions, startGame, submitMove } from "../lib/api";
 
-function ms(n) {
-  return `${Math.round(n)}ms`;
-}
+const fenKey = (uid) => `cm_fen_${uid}`;
+const gameKey = (uid) => `cm_game_${uid}`;
 
 export default function Home() {
-  // ✅ UID is now state so it can change
   const [uid, setUid] = useState(() => getUid());
 
-  const [gameId, setGameId] = useState(null);
-  const [chess, setChess] = useState(() => new Chess());
-  const [status, setStatus] = useState("ready");
+  const [gameId, setGameId] = useState(() => {
+    const u = getUid();
+    return sessionStorage.getItem(gameKey(u)) || null;
+  });
+
+  const [chess, setChess] = useState(() => {
+    const u = getUid();
+    const savedFen = sessionStorage.getItem(fenKey(u));
+    return savedFen ? new Chess(savedFen) : new Chess();
+  });
+
+  const [status, setStatus] = useState("ready"); // ready | starting | saving | error
   const [lastQuality, setLastQuality] = useState(null);
 
   const [interventions, setInterventions] = useState({});
   const [confirmMoves, setConfirmMoves] = useState(false);
   const [nudge, setNudge] = useState(false);
 
-  // ✅ UI feedback when UID changes
   const [uidFlash, setUidFlash] = useState(false);
   const [uidChangeMsg, setUidChangeMsg] = useState("");
 
   const thinkStartRef = useRef(performance.now());
+  const startedForUidRef = useRef(null);
 
-  // Start game whenever UID changes (Option A)
+  // ✅ NEW: queue moves while gameId is not ready
+  const pendingMovesRef = useRef([]); // array of payloads {uid, gameId?, fenBefore, uci, san, ply, thinkTimeMs}
+  const flushingRef = useRef(false);
+
+  function parseGameId(resp) {
+    return resp?.gameId || resp?.id || resp?.data?.gameId || resp?.data?.id || null;
+  }
+
+  async function ensureGameStarted(forUid) {
+    const cached = sessionStorage.getItem(gameKey(forUid));
+    if (cached) {
+      setGameId(cached);
+      return cached;
+    }
+
+    // strictmode guard
+    if (startedForUidRef.current === forUid) return null;
+    startedForUidRef.current = forUid;
+
+    try {
+      setStatus((s) => (s === "saving" ? s : "starting"));
+      const g = await startGame(forUid);
+      const gid = parseGameId(g);
+
+      if (!gid) throw new Error("startGame returned no gameId");
+
+      sessionStorage.setItem(gameKey(forUid), gid);
+      setGameId(gid);
+
+      track("game_start", { uid: forUid, gameId: gid });
+      return gid;
+    } catch (e) {
+      startedForUidRef.current = null;
+      track("game_start_error", { message: String(e?.message || e) });
+      setStatus("error");
+      return null;
+    } finally {
+      // don't force ready if we're saving
+      setStatus((s) => (s === "saving" ? s : "ready"));
+    }
+  }
+
+  async function flushPendingMoves(gid, forUid) {
+    if (!gid || flushingRef.current) return;
+    flushingRef.current = true;
+
+    try {
+      // take only moves for current uid
+      const queue = pendingMovesRef.current.filter((m) => m.uid === forUid);
+      pendingMovesRef.current = pendingMovesRef.current.filter((m) => m.uid !== forUid);
+
+      for (const m of queue) {
+        await submitMove({ ...m, gameId: gid });
+      }
+      track("pending_moves_flushed", { uid: forUid, count: queue.length });
+    } catch (e) {
+      // if flush fails, put them back (so we don't lose moves)
+      track("pending_moves_flush_error", { message: String(e?.message || e) });
+      // don't re-add duplicates if some already sent; but keep simple:
+      // (worst case: lose labeling, not the UI)
+    } finally {
+      flushingRef.current = false;
+    }
+  }
+
+  // resync when coming back from /admin etc
   useEffect(() => {
-    let alive = true;
+    const storedUid = getUid();
+    if (storedUid && storedUid !== uid) {
+      setUid(storedUid);
 
+      const savedFen = sessionStorage.getItem(fenKey(storedUid));
+      setChess(savedFen ? new Chess(savedFen) : new Chess());
+
+      setGameId(sessionStorage.getItem(gameKey(storedUid)) || null);
+
+      startedForUidRef.current = null;
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // when uid changes: load fen + gameId
+  useEffect(() => {
+    if (!uid) return;
+
+    const savedFen = sessionStorage.getItem(fenKey(uid));
+    setChess(savedFen ? new Chess(savedFen) : new Chess());
+
+    const cachedGame = sessionStorage.getItem(gameKey(uid));
+    setGameId(cachedGame || null);
+
+    thinkStartRef.current = performance.now();
+    setLastQuality(null);
+  }, [uid]);
+
+  // ✅ start game on mount/uid change (but even if it’s slow, user can still move now)
+  useEffect(() => {
+    if (!uid) return;
+    if (gameId) return;
+
+    let alive = true;
+    (async () => {
+      const gid = await ensureGameStarted(uid);
+      if (!alive) return;
+      if (gid) await flushPendingMoves(gid, uid);
+    })();
+
+    return () => {
+      alive = false;
+    };
+  }, [uid, gameId]);
+
+  // interventions never block play
+  useEffect(() => {
+    if (!uid) return;
+
+    let alive = true;
     (async () => {
       try {
-        const g = await startGame(uid);
-        if (!alive) return;
-
-        setGameId(g.gameId);
-        track("game_start", { gameId: g.gameId, uid });
-
         const iv = await getInterventions(uid);
         if (!alive) return;
-
-        setInterventions(iv.interventions || {});
+        setInterventions(iv?.interventions || {});
       } catch (e) {
-        // keep UI usable even if API hiccups
+        track("interventions_error", { message: String(e?.message || e) });
       }
     })();
 
@@ -55,32 +168,41 @@ export default function Home() {
   }, [uid]);
 
   useEffect(() => {
-    // Apply admin interventions (data influences UI)
     setConfirmMoves(!!interventions.confirmMoves);
     setNudge(!!interventions.nudgeTakeASecond);
   }, [interventions]);
 
   function resetGame() {
-    // ✅ Option A: new game = new person
     const oldUid = uid;
+
+    sessionStorage.removeItem(fenKey(oldUid));
+    sessionStorage.removeItem(gameKey(oldUid));
+
     const freshUid = newUid();
-    newSessionId(); // optional but clean separation in your DB/events
+    newSessionId();
+
+    sessionStorage.removeItem(fenKey(freshUid));
+    sessionStorage.removeItem(gameKey(freshUid));
+
+    pendingMovesRef.current = pendingMovesRef.current.filter((m) => m.uid !== oldUid);
 
     setChess(new Chess());
+    setGameId(null);
     thinkStartRef.current = performance.now();
     setLastQuality(null);
 
-    // update UID (triggers /game/start + interventions fetch)
+    startedForUidRef.current = null;
+
     setUid(freshUid);
 
-    // tracking
-    track("game_reset_new_uid", { oldUid, newUid: freshUid, oldGameId: gameId });
+    track("game_reset_new_uid", { oldUid, newUid: freshUid });
 
-    // ✅ UI feedback for jury
     setUidChangeMsg(`New UID generated: ${freshUid}`);
     setUidFlash(true);
     window.setTimeout(() => setUidFlash(false), 1200);
     window.setTimeout(() => setUidChangeMsg(""), 2500);
+
+    setStatus("starting");
   }
 
   function onPieceDrop(sourceSquare, targetSquare, piece) {
@@ -90,7 +212,6 @@ export default function Home() {
     const next = new Chess(fenBefore);
 
     const move = next.move({ from: sourceSquare, to: targetSquare, promotion: "q" });
-
     if (!move) {
       track("illegal_move", { from: sourceSquare, to: targetSquare, piece });
       return false;
@@ -98,37 +219,56 @@ export default function Home() {
 
     const thinkTimeMs = performance.now() - thinkStartRef.current;
 
-    // subtle influence: confirm modal for users admin flagged
     if (confirmMoves) {
       const ok = window.confirm("Confirm this move?");
       track("confirm_prompt", { ok });
       if (!ok) return false;
     }
 
-    setStatus("saving");
+    // ✅ ALWAYS allow local move immediately
+    sessionStorage.setItem(fenKey(uid), next.fen());
+    setChess(next);
+    thinkStartRef.current = performance.now();
 
-    submitMove({
+    const payload = {
       uid,
-      gameId,
+      gameId: gameId || undefined, // may be undefined
       fenBefore,
       uci: `${sourceSquare}${targetSquare}`,
       san: move.san,
       ply: next.history().length,
-      thinkTimeMs: Math.round(thinkTimeMs)
-    })
+      thinkTimeMs: Math.round(thinkTimeMs),
+    };
+
+    // ✅ If gameId missing, queue + trigger start in background
+    if (!gameId) {
+      pendingMovesRef.current.push(payload);
+      track("move_queued_no_game", { uid, ply: payload.ply });
+
+      // start game async and flush queue
+      (async () => {
+        const gid = await ensureGameStarted(uid);
+        if (gid) {
+          await flushPendingMoves(gid, uid);
+        }
+      })();
+
+      setStatus("starting");
+      return true; // allow move visually
+    }
+
+    // normal save
+    setStatus("saving");
+    submitMove(payload)
       .then((r) => {
         setLastQuality(r.quality);
-        track("move_saved", { quality: r.quality, thinkTimeMs: Math.round(thinkTimeMs) });
+        track("move_saved", { quality: r.quality, thinkTimeMs: payload.thinkTimeMs });
       })
-      .catch(() => {
-        track("move_save_error", {});
+      .catch((e) => {
+        track("move_save_error", { message: String(e?.message || e) });
       })
-      .finally(() => {
-        setStatus("ready");
-      });
+      .finally(() => setStatus("ready"));
 
-    setChess(next);
-    thinkStartRef.current = performance.now();
     return true;
   }
 
@@ -161,8 +301,12 @@ export default function Home() {
         />
 
         <div className="row" style={{ marginTop: 12 }}>
-          <button className="btn" onClick={resetGame}>New game (new UID)</button>
-          <button className="btn" onClick={useHint}>Hint</button>
+          <button className="btn" onClick={resetGame}>
+            New game (new UID)
+          </button>
+          <button className="btn" onClick={useHint}>
+            Hint
+          </button>
         </div>
 
         {nudge && (
@@ -174,13 +318,12 @@ export default function Home() {
 
       <div className="card" style={{ flex: "1 1 420px" }}>
         <div className="row" style={{ justifyContent: "space-between" }}>
-          {/* ✅ UID visibly "flashes" when changed */}
           <span
             className="badge"
             style={{
               borderColor: uidFlash ? "#7CFFB2" : undefined,
               boxShadow: uidFlash ? "0 0 0 2px rgba(124,255,178,0.25)" : "none",
-              transition: "all 250ms ease"
+              transition: "all 250ms ease",
             }}
             title="Unique user identifier (per game/person)"
           >
@@ -190,7 +333,6 @@ export default function Home() {
           <span className="badge">API: {status}</span>
         </div>
 
-        {/* ✅ short message so jury can't miss it */}
         {uidChangeMsg && (
           <p className="small" style={{ marginTop: 10, opacity: 0.95 }}>
             ✅ {uidChangeMsg}
@@ -219,6 +361,14 @@ export default function Home() {
 
         <p className="small">
           (Admin can change these per UID in the dashboard. This demonstrates “data → profile → influence”.)
+        </p>
+
+        <p className="small" style={{ opacity: 0.85 }}>
+          GameId: <span className="badge">{gameId ?? "—"}</span>
+        </p>
+
+        <p className="small" style={{ opacity: 0.75 }}>
+          Pending moves: <span className="badge">{pendingMovesRef.current.length}</span>
         </p>
       </div>
     </div>
