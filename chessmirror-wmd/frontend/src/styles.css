@@ -10,3 +10,7 @@ a { color: inherit; }
 .small { font-size: 12px; opacity: 0.8; }
 .badge { display: inline-block; padding: 4px 8px; border-radius: 999px; border: 1px solid #2a2b3f; background: #0f1016; font-size: 12px; }
 hr { border: none; border-top: 1px solid #242532; margin: 14px 0; }
+.badge.flash {
+  border-color: #7CFFB2;
+  box-shadow: 0 0 0 2px rgba(124,255,178,0.25);
+}
