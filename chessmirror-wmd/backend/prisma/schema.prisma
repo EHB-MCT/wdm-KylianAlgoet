@@ -7,6 +7,7 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
+
 model User {
   id        String   @id @default(uuid())
   uid       String   @unique
@@ -60,7 +61,6 @@ model Game {
   user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
   moves     Move[]
 }
-
 model Move {
   id          String   @id @default(uuid())
   gameId      String
@@ -68,14 +68,15 @@ model Move {
   san         String
   uci         String
   thinkTimeMs Int
-  quality     String   // good / blunder (heuristic)
+  quality     String?  // ✅ bot moves => null
+  isBot       Boolean  @default(false) // ✅ new column
   createdAt   DateTime @default(now())
 
   game        Game     @relation(fields: [gameId], references: [id], onDelete: Cascade)
 
   @@index([gameId, ply])
+  @@index([gameId, isBot])
 }
-
 model Profile {
   id              String   @id @default(uuid())
   userId          String   @unique

@@ -10,16 +10,16 @@
     "prisma:studio": "prisma studio"
   },
   "dependencies": {
-    "@prisma/client": "^5.19.1",
+    "@prisma/client": "^5.22.0",
+    "chess.js": "^1.0.0",
     "cors": "^2.8.5",
     "express": "^4.19.2",
     "helmet": "^7.1.0",
     "morgan": "^1.10.0",
     "nanoid": "^5.0.7",
-    "zod": "^3.23.8",
-    "chess.js": "^1.0.0"
+    "zod": "^3.23.8"
   },
   "devDependencies": {
-    "prisma": "^5.19.1"
+    "prisma": "^5.22.0"
   }
 }

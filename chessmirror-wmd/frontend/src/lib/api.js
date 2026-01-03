@@ -11,7 +11,6 @@ async function safeJson(res) {
 
 async function request(path, opts = {}) {
   const res = await fetch(`${API_BASE}${path}`, {
-    // important defaults
     mode: "cors",
     credentials: "omit",
     ...opts,
@@ -34,7 +33,6 @@ async function request(path, opts = {}) {
 }
 
 export async function postEvent(event) {
-  // events can be fire-and-forget, but still avoid caching weirdness
   return request("/api/track/event", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -43,27 +41,47 @@ export async function postEvent(event) {
   });
 }
 
+// ✅ helper: collect meta once (safe + trimmed)
+function collectMeta() {
+  try {
+    return {
+      tz: Intl.DateTimeFormat().resolvedOptions().timeZone,
+      lang: navigator.language,
+      userAgent: navigator.userAgent?.slice(0, 256),
+      screenW: window.screen?.width,
+      screenH: window.screen?.height,
+    };
+  } catch {
+    return {};
+  }
+}
+
 export async function startGame(uid) {
-  // IMPORTANT: no-store so dev caching can't cause weirdness
+  // ✅ now sends meta (backend supports it)
   return request("/api/game/start", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     cache: "no-store",
-    body: JSON.stringify({ uid }),
+    body: JSON.stringify({ uid, meta: collectMeta() }),
   });
 }
 
 export async function submitMove(payload) {
+  // ✅ normalize payload (backend expects isBot optionally)
+  const body = {
+    ...payload,
+    isBot: !!payload?.isBot,
+  };
+
   return request("/api/game/move", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     cache: "no-store",
-    body: JSON.stringify(payload),
+    body: JSON.stringify(body),
   });
 }
 
 export async function getInterventions(uid) {
-  // cache-bust (some browsers keep GET cached aggressively in dev)
   const t = Date.now();
   return request(`/api/interventions/${encodeURIComponent(uid)}?t=${t}`, {
     method: "GET",

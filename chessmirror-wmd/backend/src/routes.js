@@ -12,13 +12,13 @@ export const router = express.Router();
 
 /**
  * HARD FIX: Race-safe user+profile creation.
- * - Upsert user by uid
- * - Ensure profile with createMany(skipDuplicates) => never throws, never aborts tx
- * - Always return user with profile included
+ * - Create user if missing (createMany + skipDuplicates)
+ * - Always update meta
+ * - Ensure profile exists (createMany + skipDuplicates)
+ * - Return user with profile
  */
 async function getOrCreateUser(uid, meta = {}) {
   return prisma.$transaction(async (tx) => {
-    // 1) Create user if missing (race-safe)
     await tx.user.createMany({
       data: [
         {
@@ -33,7 +33,6 @@ async function getOrCreateUser(uid, meta = {}) {
       skipDuplicates: true,
     });
 
-    // 2) Always update meta (safe, user exists after createMany)
     await tx.user.update({
       where: { uid },
       data: {
@@ -45,17 +44,14 @@ async function getOrCreateUser(uid, meta = {}) {
       },
     });
 
-    // 3) Read user (need id)
     const user = await tx.user.findUnique({ where: { uid } });
     if (!user) throw new Error("User not found after createMany");
 
-    // 4) Ensure profile exists (race-safe)
     await tx.profile.createMany({
       data: [{ userId: user.id }],
       skipDuplicates: true,
     });
 
-    // 5) Return fresh user + profile
     return tx.user.findUnique({
       where: { uid },
       include: { profile: true },
@@ -64,12 +60,10 @@ async function getOrCreateUser(uid, meta = {}) {
 }
 
 async function ensureProfile(userId) {
-  // Never throws on duplicates
   await prisma.profile.createMany({
     data: [{ userId }],
     skipDuplicates: true,
   });
-
   return prisma.profile.findUnique({ where: { userId } });
 }
 
@@ -156,7 +150,11 @@ router.post("/game/start", async (req, res) => {
     const user = await getOrCreateUser(uid, meta || {});
     if (!user) return res.status(500).json({ error: "User create failed" });
 
-    const game = await prisma.game.create({ data: { userId: user.id } });
+    const game = await prisma.game.create({
+      data: { userId: user.id },
+      select: { id: true },
+    });
+
     return res.json({ gameId: game.id });
   } catch (err) {
     console.error("START ERROR:", err);
@@ -167,16 +165,41 @@ router.post("/game/start", async (req, res) => {
 // ===== Submit move =====
 router.post("/game/move", async (req, res) => {
   try {
-    const { uid, gameId, fenBefore, uci, san, ply, thinkTimeMs } = req.body || {};
-    if (!uid || !gameId || !fenBefore || !uci || !san || typeof ply !== "number") {
+    const {
+      uid,
+      gameId,
+      fenBefore,
+      uci,
+      san,
+      ply,
+      thinkTimeMs,
+      isBot, // ✅ NEW (frontend stuurt true voor bot moves)
+    } = req.body || {};
+
+    if (
+      !uid ||
+      !gameId ||
+      !fenBefore ||
+      !uci ||
+      !san ||
+      typeof ply !== "number"
+    ) {
       return res.status(400).json({ error: "Missing fields" });
     }
 
     const user = await safeUserByUid(uid);
     if (!user) return res.status(404).json({ error: "Unknown uid" });
 
+    // ✅ HARD FK FIX: ensure the game exists (even after docker down -v)
+    await prisma.game.upsert({
+      where: { id: gameId },
+      update: {},
+      create: { id: gameId, userId: user.id },
+    });
+
+    // Validate move is legal (for BOTH player + bot)
     const chess = new Chess(fenBefore);
-    const move = chess.move(
+    const parsed = chess.move(
       {
         from: uci.slice(0, 2),
         to: uci.slice(2, 4),
@@ -185,27 +208,52 @@ router.post("/game/move", async (req, res) => {
       { sloppy: true }
     );
 
-    if (!move) {
+    if (!parsed) {
       return res.status(400).json({ error: "Illegal/invalid move" });
     }
 
-    const quality = labelMoveQuality(chess, move);
+    const bot = !!isBot;
 
-    await prisma.move.create({
-      data: {
-        gameId,
-        ply,
-        uci,
-        san,
-        thinkTimeMs: Math.max(0, Math.min(600000, thinkTimeMs ?? 0)),
-        quality,
-      },
-    });
+    // ✅ quality: only for PLAYER moves
+    const quality = bot ? null : labelMoveQuality(chess, parsed);
 
+    // ✅ create move, but dedupe if already exists (gameId, ply)
+    try {
+      await prisma.move.create({
+        data: {
+          gameId,
+          ply,
+          uci,
+          san,
+          thinkTimeMs: Math.max(0, Math.min(600000, thinkTimeMs ?? 0)),
+          quality,
+          isBot: bot,
+        },
+      });
+    } catch (err) {
+      // Unique constraint hit => retry/double-submit: return ok
+      if (err?.code === "P2002") {
+        return res.json({
+          ok: true,
+          quality: bot ? null : "ok",
+          deduped: true,
+          isBot: bot,
+        });
+      }
+      throw err;
+    }
+
+    // ✅ Do NOT let bot moves affect profile or segment
+    if (bot) {
+      return res.json({ ok: true, quality: null, isBot: true });
+    }
+
+    // --- Player move => update profile stats ---
     const prev = user.profile ?? (await ensureProfile(user.id));
 
     const moveCount = (prev?.moveCount ?? 0) + 1;
-    const blunderCount = (prev?.blunderCount ?? 0) + (quality === "blunder" ? 1 : 0);
+    const blunderCount =
+      (prev?.blunderCount ?? 0) + (quality === "blunder" ? 1 : 0);
 
     const prevMoveCount = prev?.moveCount ?? 0;
     const prevAvg = prev?.avgThinkTimeMs ?? 0;
@@ -224,10 +272,10 @@ router.post("/game/move", async (req, res) => {
       data: { segment: computeSegment(updated) },
     });
 
-    res.json({ ok: true, quality });
+    return res.json({ ok: true, quality, isBot: false });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: "Server error", code: err?.code });
+    return res.status(500).json({ error: "Server error", code: err?.code });
   }
 });
 
@@ -269,6 +317,15 @@ router.get("/admin/users/:uid/profile", adminAuth, async (req, res) => {
     let profile = user.profile;
     if (!profile) profile = await ensureProfile(user.id);
 
+    // Profile-based stats (HUMAN ONLY, because we never update profile on bot moves)
+    const moveCount = profile?.moveCount ?? 0;
+    const blunderCount = profile?.blunderCount ?? 0;
+    const avgThinkTimeMs = profile?.avgThinkTimeMs ?? 0;
+    const hintCount = profile?.hintCount ?? 0;
+
+    const blunderRate =
+      moveCount > 0 ? Math.round((blunderCount / moveCount) * 100) : 0;
+
     const games = await prisma.game.findMany({
       where: { userId: user.id },
       orderBy: { createdAt: "desc" },
@@ -283,6 +340,7 @@ router.get("/admin/users/:uid/profile", adminAuth, async (req, res) => {
           ply: m.ply,
           thinkTimeMs: m.thinkTimeMs,
           quality: m.quality,
+          isBot: m.isBot,
           createdAt: m.createdAt,
         }))
       )
@@ -294,18 +352,18 @@ router.get("/admin/users/:uid/profile", adminAuth, async (req, res) => {
       take: 200,
     });
 
+    // Hovers are events, but we normalize by HUMAN moveCount (profile-based) for consistency
     const hoverCount = events.filter((e) => e.type === "hover").length;
-
-    const moveCount = profile?.moveCount ?? 0;
-    const blunderCount = profile?.blunderCount ?? 0;
-    const avgThinkTimeMs = profile?.avgThinkTimeMs ?? 0;
-
-    const blunderRate = moveCount > 0 ? Math.round((blunderCount / moveCount) * 100) : 0;
+    const hoversPerMove =
+      moveCount > 0 ? Math.round((hoverCount / moveCount) * 10) / 10 : 0;
 
     const stats = {
+      moves: moveCount,
       avgThinkTime: Math.round((avgThinkTimeMs / 1000) * 10) / 10,
       blunderRate,
+      hintCount,
       hoverCount,
+      hoversPerMove,
     };
 
     const insight = getBehaviorInsight(stats);
@@ -335,7 +393,7 @@ router.get("/admin/users/:uid/profile", adminAuth, async (req, res) => {
       segment,
       insight,
       stats,
-      moves: flatMoves,
+      moves: flatMoves, // includes bot+human for the chart/table, but stats ignore bot
       recentEvents: events.slice(0, 25),
     });
   } catch (err) {

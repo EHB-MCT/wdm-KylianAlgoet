@@ -269,6 +269,8 @@ export default function Home() {
               san: played.san,
               ply: botPly,
               thinkTimeMs: botThinkMs,
+                isBot: true, 
+
             });
             track("bot_move_saved", { uid, gameId: gid, ply: botPly, botMode: pick.mode });
           } catch (e) {

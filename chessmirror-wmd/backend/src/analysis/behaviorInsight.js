@@ -1,14 +1,17 @@
-
 export function getBehaviorInsight(stats) {
-  const { avgThinkTime, blunderRate, hoverCount } = stats;
+  const { avgThinkTime, blunderRate, hoverCount, moveCount } = stats;
 
-  if (avgThinkTime < 4 && blunderRate > 40) {
+  const hoversPerMove = moveCount > 0 ? hoverCount / moveCount : 0;
+
+  // Impulsive: fast + inaccurate
+  if (avgThinkTime < 3 && blunderRate > 40) {
     return {
       label: "Impulsive",
-      text: "Fast decision-making combined with a high blunder rate suggests impulsive play under pressure."
+      text: "Fast decision-making combined with frequent mistakes suggests impulsive play."
     };
   }
 
+  // Reflective: slow + accurate
   if (avgThinkTime > 6 && blunderRate < 25) {
     return {
       label: "Reflective",
@@ -16,15 +19,16 @@ export function getBehaviorInsight(stats) {
     };
   }
 
-  if (hoverCount > 20) {
+  // Hesitant: slow + high exploration
+  if (avgThinkTime > 4 && hoversPerMove > 4) {
     return {
       label: "Hesitant",
-      text: "Frequent hovering suggests hesitation and uncertainty before committing moves."
+      text: "Extended thinking combined with frequent board exploration suggests hesitation before committing moves."
     };
   }
 
   return {
     label: "Unstable",
-    text: "Inconsistent thinking patterns suggest fluctuating focus or strategy."
+    text: "Inconsistent thinking and exploration patterns suggest fluctuating focus or strategy."
   };
 }
