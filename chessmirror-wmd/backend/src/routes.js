@@ -1,5 +1,4 @@
 import express from "express";
-import { nanoid } from "nanoid";
 import { prisma } from "./prisma.js";
 import { hashIp, computeSegment } from "./util.js";
 import { validateEvent } from "./middleware/validateEvent.js";
@@ -102,7 +101,7 @@ router.post("/track/event", validateEvent, async (req, res) => {
       req.socket.remoteAddress ||
       "unknown";
 
-    const user = await getOrCreateUser(e.uid, e.meta);
+    const user = await getOrCreateUser(e.uid, e.meta || {});
     if (!user) return res.status(500).json({ error: "User create failed" });
 
     const session = await upsertSessionForEvent(user.id, e.sessionId, ip);
@@ -165,16 +164,8 @@ router.post("/game/start", async (req, res) => {
 // ===== Submit move =====
 router.post("/game/move", async (req, res) => {
   try {
-    const {
-      uid,
-      gameId,
-      fenBefore,
-      uci,
-      san,
-      ply,
-      thinkTimeMs,
-      isBot, // ✅ NEW (frontend stuurt true voor bot moves)
-    } = req.body || {};
+    const { uid, gameId, fenBefore, uci, san, ply, thinkTimeMs, isBot } =
+      req.body || {};
 
     if (
       !uid ||
@@ -231,7 +222,6 @@ router.post("/game/move", async (req, res) => {
         },
       });
     } catch (err) {
-      // Unique constraint hit => retry/double-submit: return ok
       if (err?.code === "P2002") {
         return res.json({
           ok: true,
@@ -279,6 +269,83 @@ router.post("/game/move", async (req, res) => {
   }
 });
 
+// ===== Public profile (segment-aware, no auth) =====
+// GET /api/profile/:uid -> { segment, stats }
+router.get("/profile/:uid", async (req, res) => {
+  try {
+    const uid = req.params.uid;
+
+    const user = await prisma.user.findUnique({
+      where: { uid },
+      include: { profile: true },
+    });
+
+    if (!user) {
+      return res.json({
+        segment: "UNKNOWN",
+        stats: {
+          moves: 0,
+          avgThinkTime: 0,
+          blunderRate: 0,
+          hoverCount: 0,
+          hoversPerMove: 0,
+          hintsUsed: 0,
+        },
+      });
+    }
+
+    let profile = user.profile;
+    if (!profile) profile = await ensureProfile(user.id);
+
+    const moveCount = profile?.moveCount ?? 0;
+    const blunderCount = profile?.blunderCount ?? 0;
+    const avgThinkTimeMs = profile?.avgThinkTimeMs ?? 0;
+
+    const blunderRate =
+      moveCount > 0 ? Math.round((blunderCount / moveCount) * 100) : 0;
+
+    const events = await prisma.event.findMany({
+      where: { userId: user.id },
+      orderBy: { ts: "desc" },
+      take: 500,
+    });
+
+    const hoverCount = events.filter((e) => e.type === "hover").length;
+
+    // ✅ source of truth: profile.hintCount (not event scan, avoids drift)
+    const hintsUsed = profile?.hintCount ?? 0;
+
+    const hoversPerMove =
+      moveCount > 0 ? Math.round((hoverCount / moveCount) * 10) / 10 : 0;
+
+    const stats = {
+      moves: moveCount,
+        moveCount, // ✅ alias so nothing breaks
+
+      avgThinkTime: Math.round((avgThinkTimeMs / 1000) * 10) / 10,
+      blunderRate,
+      hoverCount,
+      hoversPerMove,
+      hintsUsed,
+    };
+
+    const insight = getBehaviorInsight(stats);
+    const segment = insight.label; // whatever your insight uses
+
+    if (profile?.segment !== segment) {
+      await prisma.profile.update({
+        where: { userId: user.id },
+        data: { segment },
+      });
+    }
+
+    return res.json({ segment, stats });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: "Server error" });
+  }
+});
+
 // ===== Admin routes =====
 router.get("/admin/users", adminAuth, async (req, res) => {
   try {
@@ -317,7 +384,6 @@ router.get("/admin/users/:uid/profile", adminAuth, async (req, res) => {
     let profile = user.profile;
     if (!profile) profile = await ensureProfile(user.id);
 
-    // Profile-based stats (HUMAN ONLY, because we never update profile on bot moves)
     const moveCount = profile?.moveCount ?? 0;
     const blunderCount = profile?.blunderCount ?? 0;
     const avgThinkTimeMs = profile?.avgThinkTimeMs ?? 0;
@@ -352,13 +418,14 @@ router.get("/admin/users/:uid/profile", adminAuth, async (req, res) => {
       take: 200,
     });
 
-    // Hovers are events, but we normalize by HUMAN moveCount (profile-based) for consistency
     const hoverCount = events.filter((e) => e.type === "hover").length;
     const hoversPerMove =
       moveCount > 0 ? Math.round((hoverCount / moveCount) * 10) / 10 : 0;
 
     const stats = {
       moves: moveCount,
+        moveCount, // ✅ alias so nothing breaks
+
       avgThinkTime: Math.round((avgThinkTimeMs / 1000) * 10) / 10,
       blunderRate,
       hintCount,
@@ -393,7 +460,7 @@ router.get("/admin/users/:uid/profile", adminAuth, async (req, res) => {
       segment,
       insight,
       stats,
-      moves: flatMoves, // includes bot+human for the chart/table, but stats ignore bot
+      moves: flatMoves,
       recentEvents: events.slice(0, 25),
     });
   } catch (err) {
@@ -408,7 +475,11 @@ router.get("/admin/users/:uid/events", adminAuth, async (req, res) => {
     const user = await prisma.user.findUnique({ where: { uid } });
     if (!user) return res.status(404).json({ error: "Not found" });
 
-    const take = Math.min(500, Math.max(1, parseInt(req.query.take ?? "200", 10)));
+    const take = Math.min(
+      500,
+      Math.max(1, parseInt(req.query.take ?? "200", 10))
+    );
+
     const events = await prisma.event.findMany({
       where: { userId: user.id },
       orderBy: { ts: "desc" },
@@ -443,18 +514,42 @@ router.post("/admin/users/:uid/interventions", adminAuth, async (req, res) => {
   }
 });
 
+/**
+ * ✅ FIX: interventions should never be empty anymore
+ * Default behavior:
+ * - nudgeTakeASecond: true  (ALWAYS ON by default)
+ * - confirmMoves: false     (admin-only annoyance)
+ *
+ * If admin has made a decision for this user -> use that decision (overrides defaults).
+ * If user doesn't exist yet -> still return defaults.
+ */
 router.get("/interventions/:uid", async (req, res) => {
   try {
     const uid = req.params.uid;
+
+    // ✅ defaults (WMD)
+    const defaults = {
+      nudgeTakeASecond: true,
+      confirmMoves: false,
+    };
+
     const user = await prisma.user.findUnique({ where: { uid } });
-    if (!user) return res.json({ interventions: {} });
+
+    // user not created yet -> still return defaults
+    if (!user) return res.json({ interventions: defaults });
 
     const last = await prisma.adminDecision.findFirst({
       where: { userId: user.id },
       orderBy: { createdAt: "desc" },
     });
 
-    res.json({ interventions: last?.interventions ?? {} });
+    // merge: admin overrides defaults
+    const merged = {
+      ...defaults,
+      ...(last?.interventions ?? {}),
+    };
+
+    res.json({ interventions: merged });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Server error" });

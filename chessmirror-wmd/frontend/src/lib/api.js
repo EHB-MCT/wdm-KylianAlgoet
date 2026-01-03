@@ -90,6 +90,16 @@ export async function getInterventions(uid) {
   });
 }
 
+export async function getProfile(uid) {
+  const t = Date.now();
+  return request(`/api/profile/${encodeURIComponent(uid)}?t=${t}`, {
+    method: "GET",
+    cache: "no-store",
+    headers: { "Cache-Control": "no-store" },
+  });
+}
+
+
 export async function adminListUsers(adminPassword) {
   const t = Date.now();
   return request(`/api/admin/users?t=${t}`, {

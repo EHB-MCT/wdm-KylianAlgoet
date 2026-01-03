@@ -1,12 +1,13 @@
-import React, { useEffect, useRef, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { Chess } from "chess.js";
 import { Chessboard } from "react-chessboard";
 import { getUid, newUid, newSessionId } from "../lib/uid";
 import { track } from "../lib/tracker";
-import { getInterventions, startGame, submitMove } from "../lib/api";
+import { getInterventions, startGame, submitMove, getProfile } from "../lib/api";
 
 const fenKey = (uid) => `cm_fen_${uid}`;
 const gameKey = (uid) => `cm_game_${uid}`;
+const BOARD_WIDTH = 420;
 
 // --- Bot helpers (lightweight, no engine) ---
 const PIECE_VALUE = { p: 1, n: 3, b: 3, r: 5, q: 9, k: 0 };
@@ -21,7 +22,7 @@ function materialEval(chess) {
       score += sq.color === "w" ? v : -v;
     }
   }
-  return score; // + = white better, - = black better
+  return score;
 }
 
 function pickWeightedRandom(items) {
@@ -34,13 +35,95 @@ function pickWeightedRandom(items) {
   return items[items.length - 1]?.item ?? null;
 }
 
-// chess.js compatibility: v0 uses inCheck(), v1 uses isCheck()
 function isCheckCompat(ch) {
   return (
     (typeof ch.isCheck === "function" && ch.isCheck()) ||
     (typeof ch.inCheck === "function" && ch.inCheck()) ||
     false
   );
+}
+
+// --- Dynamic nudge system (FIXED lifecycle) ---
+const NUDGE_COOLDOWN_MS = 20000; // 20s
+const NUDGE_MIN_VISIBLE_MS = 4500; // minstens even zichtbaar
+const NUDGE_MAX_VISIBLE_MS = 10000; // max 10s
+const NUDGE_AFTER_MOVE_GRACE_MS = 900;
+const NUDGE_SHOW_PROB = 0.45; // niet elke trigger -> nudge
+
+function normalizeSegment(seg) {
+  const s = String(seg || "").trim();
+  if (!s) return "UNKNOWN";
+  return s.toUpperCase();
+}
+
+function pickNudgeMessage({ segment, thinkTimeMs, hoverBurst }) {
+  const seg = normalizeSegment(segment);
+
+  if (seg === "HESITANT")
+    return "Players like you often perform better when they trust their first instinct.";
+  if (seg === "IMPULSIVE")
+    return "Players with your style benefit from pausing before committing.";
+  if (seg === "REFLECTIVE" || seg === "CAREFUL")
+    return "Your calm pace is working — keep scanning checks/captures.";
+  if (seg === "UNSTABLE")
+    return "Consistency tends to create stronger positions over time.";
+
+  if (hoverBurst >= 8)
+    return "Try trusting your first idea — too much exploring can slow you down.";
+  if (thinkTimeMs >= 4200)
+    return "Take a second — then commit. Overthinking can cost you momentum.";
+  if (thinkTimeMs <= 900)
+    return "Quick moves are risky — a brief pause can boost accuracy.";
+
+  return "Take a second. Then commit.";
+}
+
+function getBehavioralHint({ segment, hoverBurst, thinkTimeMs }) {
+  const seg = normalizeSegment(segment);
+  if (seg === "HESITANT")
+    return "Pick ONE candidate move, quickly check checks/captures, then commit.";
+  if (seg === "IMPULSIVE")
+    return "Before moving: scan (1) opponent captures, (2) your king safety, (3) checks.";
+  if (seg === "REFLECTIVE" || seg === "CAREFUL")
+    return "Good pace — prioritize forcing lines (checks/captures) to convert advantages.";
+  if (seg === "UNSTABLE")
+    return "Use a consistent routine: checks → captures → threats → develop.";
+
+  if (hoverBurst >= 8)
+    return "You’re exploring a lot — shortlist 2 moves and pick the safer one.";
+  if (thinkTimeMs <= 900)
+    return "Slow down: ask ‘what’s my opponent’s best reply?’ before dropping.";
+  if (thinkTimeMs >= 4200)
+    return "Avoid perfect-move hunting: choose a solid plan and commit.";
+  return "Scan checks/captures first. If none: improve a piece.";
+}
+
+function getTacticalHint(ch) {
+  try {
+    const legal = ch.moves({ verbose: true });
+    if (!legal.length) return "No legal moves.";
+
+    const checks = legal.filter(
+      (m) => (m.san || "").includes("+") || (m.san || "").includes("#")
+    );
+    const captures = legal.filter(
+      (m) => (m.flags || "").includes("c") || (m.flags || "").includes("e")
+    );
+
+    if (checks.length) {
+      const sample = checks.slice(0, 3).map((m) => m.san).join(", ");
+      return `Look for checks: ${sample}. Start with forcing moves.`;
+    }
+
+    if (captures.length) {
+      const sample = captures.slice(0, 3).map((m) => m.san).join(", ");
+      return `Look for captures: ${sample}. Compare piece values before trading.`;
+    }
+
+    return "No immediate checks/captures. Improve development and king safety.";
+  } catch {
+    return "Hint unavailable for this position.";
+  }
 }
 
 export default function Home() {
@@ -57,12 +140,20 @@ export default function Home() {
     return savedFen ? new Chess(savedFen) : new Chess();
   });
 
-  const [status, setStatus] = useState("ready"); // ready | starting | saving | bot | error
+  const [status, setStatus] = useState("ready");
   const [lastQuality, setLastQuality] = useState(null);
 
   const [interventions, setInterventions] = useState({});
   const [confirmMoves, setConfirmMoves] = useState(false);
-  const [nudge, setNudge] = useState(false);
+
+  // ✅ nudge default ON (maar admin kan het uitzetten)
+  const [nudgeEnabled, setNudgeEnabled] = useState(true);
+
+  // nudge lifecycle
+  const [nudge, setNudge] = useState(null);
+  const lastNudgeAtRef = useRef(0);
+  const nudgeHideTimerRef = useRef(null);
+  const nudgeMaxTimerRef = useRef(null);
 
   const [uidFlash, setUidFlash] = useState(false);
   const [uidChangeMsg, setUidChangeMsg] = useState("");
@@ -73,17 +164,27 @@ export default function Home() {
   // queue moves while gameId is not ready
   const pendingMovesRef = useRef([]);
   const flushingRef = useRef(false);
+  const [pendingCount, setPendingCount] = useState(0);
 
-  // --- BOT STATE ---
-  const botThinkingRef = useRef(false); // internal guard (no re-render)
+  // bot
+  const botThinkingRef = useRef(false);
   const botTimerRef = useRef(null);
-
-  // ✅ UI state (causes re-render) — THIS FIXES YOUR “1 move then stuck”
   const [botThinking, setBotThinking] = useState(false);
 
-  // small behavior memory (client-side) to make bot “stimulus”
+  // behavior memory
   const recentFastMovesRef = useRef(0);
   const recentBlundersRef = useRef(0);
+
+  // profile
+  const [segment, setSegment] = useState("UNKNOWN");
+  const [profileStats, setProfileStats] = useState(null);
+
+  // hover burst tracker
+  const hoverBurstRef = useRef({ count: 0, windowStart: 0 });
+
+  // ✅ Hint panel state
+  const [hintOpen, setHintOpen] = useState(false);
+  const [hintData, setHintData] = useState(null);
 
   function parseGameId(resp) {
     return resp?.gameId || resp?.id || resp?.data?.gameId || resp?.data?.id || null;
@@ -93,18 +194,87 @@ export default function Home() {
     if (botTimerRef.current) window.clearTimeout(botTimerRef.current);
     botTimerRef.current = null;
     botThinkingRef.current = false;
-    setBotThinking(false); // ✅ unlock UI
+    setBotThinking(false);
   }
+
+  function clearNudgeTimers() {
+    if (nudgeHideTimerRef.current) window.clearTimeout(nudgeHideTimerRef.current);
+    if (nudgeMaxTimerRef.current) window.clearTimeout(nudgeMaxTimerRef.current);
+    nudgeHideTimerRef.current = null;
+    nudgeMaxTimerRef.current = null;
+  }
+
+  function hideNudgeSoft(delayMs = 0) {
+    clearNudgeTimers();
+    nudgeHideTimerRef.current = window.setTimeout(() => {
+      setNudge(null);
+      nudgeHideTimerRef.current = null;
+    }, Math.max(0, delayMs));
+  }
+
+  function showNudge({ msg, reason }) {
+    const now = Date.now();
+    if (now - lastNudgeAtRef.current < NUDGE_COOLDOWN_MS) return;
+
+    lastNudgeAtRef.current = now;
+    clearNudgeTimers();
+
+    setNudge({
+      msg,
+      reason,
+      shownAt: now,
+      segmentAtShow: segment
+    });
+
+    nudgeMaxTimerRef.current = window.setTimeout(() => {
+      setNudge(null);
+      nudgeMaxTimerRef.current = null;
+    }, NUDGE_MAX_VISIBLE_MS);
+  }
+
+function maybeShowNudge({ thinkTimeMs, hoverBurst }) {
+  const moves = profileStats?.moves ?? 0;
+  if (moves < 6) return; // ✅ no nudges during warming up
+
+  if (!nudgeEnabled) return;
+  if (nudge) return;
+
+  const tooFast = thinkTimeMs <= 900;
+  const tooSlow = thinkTimeMs >= 4200;
+  const tooManyHovers = hoverBurst >= 8;
+
+  let reason = null;
+  if (tooManyHovers) reason = "hoverBurst";
+  else if (tooSlow) reason = "tooSlow";
+  else if (tooFast) reason = "tooFast";
+  else return;
+
+  if (Math.random() > NUDGE_SHOW_PROB) return;
+
+  const msg = pickNudgeMessage({ segment, thinkTimeMs, hoverBurst });
+  showNudge({ msg, reason });
+}
 
   // cleanup on unmount
   useEffect(() => {
-    return () => cancelBot();
+    return () => {
+      cancelBot();
+      clearNudgeTimers();
+    };
   }, []);
+
+  async function refreshProfile(forUid) {
+    try {
+      const p = await getProfile(forUid);
+      setSegment(normalizeSegment(p?.segment ?? "UNKNOWN"));
+      setProfileStats(p?.stats ?? null);
+    } catch (e) {
+      track("profile_fetch_error", { message: String(e?.message || e) });
+    }
+  }
 
   async function ensureGameStarted(forUid, force = false) {
     const cached = sessionStorage.getItem(gameKey(forUid));
-
-    // use cache only if not forcing
     if (cached && !force) {
       setGameId(cached);
       return cached;
@@ -115,7 +285,6 @@ export default function Home() {
 
     try {
       setStatus((s) => (s === "saving" || s === "bot" ? s : "starting"));
-
       const g = await startGame(forUid);
       const gid = parseGameId(g);
       if (!gid) throw new Error("startGame returned no gameId");
@@ -142,6 +311,7 @@ export default function Home() {
     try {
       const queue = pendingMovesRef.current.filter((m) => m.uid === forUid);
       pendingMovesRef.current = pendingMovesRef.current.filter((m) => m.uid !== forUid);
+      setPendingCount(pendingMovesRef.current.length);
 
       for (const m of queue) {
         await submitMove({ ...m, gameId: gid });
@@ -170,12 +340,10 @@ export default function Home() {
     const scored = legal.map((m) => {
       const tmp = new Chess(ch.fen());
       tmp.move(m);
-
       const evalAfter = materialEval(tmp);
       const turn = ch.turn();
       const perspectiveScore = turn === "w" ? evalAfter : -evalAfter;
       const givesCheck = isCheckCompat(tmp);
-
       return { m, perspectiveScore, givesCheck };
     });
 
@@ -213,7 +381,7 @@ export default function Home() {
     if (botThinkingRef.current) return;
 
     botThinkingRef.current = true;
-    setBotThinking(true); // ✅ re-render -> unlock later works
+    setBotThinking(true);
     setStatus("bot");
 
     const botThinkMs = 450 + Math.floor(Math.random() * 700);
@@ -222,7 +390,6 @@ export default function Home() {
       botTimerRef.current = null;
 
       try {
-        // Ensure game exists (DB might be wiped)
         let gid = gameId;
         if (!gid) gid = await ensureGameStarted(uid, true);
         if (gid) await flushPendingMoves(gid, uid);
@@ -235,7 +402,6 @@ export default function Home() {
         const played = base.move(pick.move);
         const fenAfter = base.fen();
 
-        // Update UI immediately
         sessionStorage.setItem(fenKey(uid), fenAfter);
         setChess(base);
         thinkStartRef.current = performance.now();
@@ -243,7 +409,6 @@ export default function Home() {
         const botUci = `${played.from}${played.to}${played.promotion ?? ""}`;
         const botPly = base.history().length;
 
-        // 1) Log bot move as event (rich metadata)
         track("bot_move", {
           uid,
           gameId: gid || null,
@@ -255,10 +420,9 @@ export default function Home() {
           uci: botUci,
           san: played.san,
           plyAfter: botPly,
-          playerLast: meta,
+          playerLast: meta
         });
 
-        // 2) Also store bot move in moves table
         if (gid) {
           try {
             await submitMove({
@@ -269,8 +433,7 @@ export default function Home() {
               san: played.san,
               ply: botPly,
               thinkTimeMs: botThinkMs,
-                isBot: true, 
-
+              isBot: true
             });
             track("bot_move_saved", { uid, gameId: gid, ply: botPly, botMode: pick.mode });
           } catch (e) {
@@ -281,30 +444,27 @@ export default function Home() {
         track("bot_move_error", { message: String(e?.message || e) });
       } finally {
         botThinkingRef.current = false;
-        setBotThinking(false); // ✅ unlock UI
+        setBotThinking(false);
         setStatus("ready");
       }
     }, botThinkMs);
   }
 
-  // resync when coming back from /admin etc
+  // resync when coming back
   useEffect(() => {
     const storedUid = getUid();
     if (storedUid && storedUid !== uid) {
       setUid(storedUid);
-
       const savedFen = sessionStorage.getItem(fenKey(storedUid));
       setChess(savedFen ? new Chess(savedFen) : new Chess());
-
       setGameId(sessionStorage.getItem(gameKey(storedUid)) || null);
-
       startedForUidRef.current = null;
       cancelBot();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // when uid changes: load fen + gameId
+  // when uid changes
   useEffect(() => {
     if (!uid) return;
 
@@ -320,13 +480,21 @@ export default function Home() {
     recentFastMovesRef.current = 0;
     recentBlundersRef.current = 0;
     cancelBot();
+
+    clearNudgeTimers();
+    setNudge(null);
+
+    setHintOpen(false);
+    setHintData(null);
+
+    refreshProfile(uid);
   }, [uid]);
 
-  // ✅ start game on mount/uid change (FORCED) so docker down -v never breaks cache
+  // start game forced
   useEffect(() => {
     if (!uid) return;
-
     let alive = true;
+
     (async () => {
       const gid = await ensureGameStarted(uid, true);
       if (!alive) return;
@@ -339,7 +507,7 @@ export default function Home() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [uid]);
 
-  // interventions never block play
+  // interventions (admin)
   useEffect(() => {
     if (!uid) return;
 
@@ -359,9 +527,12 @@ export default function Home() {
     };
   }, [uid]);
 
+  // KEY FIX: confirmMoves from admin; nudge can be toggled by admin
   useEffect(() => {
     setConfirmMoves(!!interventions.confirmMoves);
-    setNudge(!!interventions.nudgeTakeASecond);
+    if (typeof interventions.nudgeTakeASecond === "boolean") {
+      setNudgeEnabled(interventions.nudgeTakeASecond);
+    }
   }, [interventions]);
 
   function resetGame() {
@@ -377,8 +548,14 @@ export default function Home() {
     sessionStorage.removeItem(gameKey(freshUid));
 
     pendingMovesRef.current = pendingMovesRef.current.filter((m) => m.uid !== oldUid);
+    setPendingCount(pendingMovesRef.current.length);
 
     cancelBot();
+    clearNudgeTimers();
+    setNudge(null);
+
+    setHintOpen(false);
+    setHintData(null);
 
     setChess(new Chess());
     setGameId(null);
@@ -402,7 +579,6 @@ export default function Home() {
   function onPieceDrop(sourceSquare, targetSquare, piece) {
     track("drop_attempt", { from: sourceSquare, to: targetSquare, piece });
 
-    // ✅ block while bot is thinking (state, not ref)
     if (botThinking) {
       track("move_blocked_bot_turn", { from: sourceSquare, to: targetSquare });
       return false;
@@ -428,7 +604,28 @@ export default function Home() {
       if (!ok) return false;
     }
 
-    // update UI immediately
+    // ✅ close hint AFTER confirm (so cancel keeps hint open)
+    setHintOpen(false);
+    setHintData(null);
+
+  const hb = hoverBurstRef.current.count;
+const moveCountNow = next.history().length; // ✅ direct bekend na next.move(...)
+maybeShowNudge({ thinkTimeMs, hoverBurst: hb, moveCountNow });
+
+
+    // after commit: keep nudge a bit
+    if (nudge) {
+      const now = Date.now();
+      const visibleFor = now - (nudge.shownAt || now);
+      if (visibleFor >= NUDGE_MIN_VISIBLE_MS) {
+        hideNudgeSoft(NUDGE_AFTER_MOVE_GRACE_MS);
+      }
+    }
+
+    // reset hover burst
+    hoverBurstRef.current.count = 0;
+    hoverBurstRef.current.windowStart = Date.now();
+
     sessionStorage.setItem(fenKey(uid), next.fen());
     setChess(next);
     thinkStartRef.current = performance.now();
@@ -440,7 +637,7 @@ export default function Home() {
       uci: `${sourceSquare}${targetSquare}`,
       san: move.san,
       ply: next.history().length,
-      thinkTimeMs: Math.round(thinkTimeMs),
+      thinkTimeMs: Math.round(thinkTimeMs)
     };
 
     const playerMetaForBot = {
@@ -448,18 +645,19 @@ export default function Home() {
       san: payload.san,
       thinkTimeMs: payload.thinkTimeMs,
       ply: payload.ply,
-      quality: lastQuality ?? null,
+      quality: lastQuality ?? null
     };
 
-    // If gameId missing, queue + start in background
     if (!gameId) {
       pendingMovesRef.current.push(payload);
+      setPendingCount(pendingMovesRef.current.length);
       track("move_queued_no_game", { uid, ply: payload.ply });
 
       (async () => {
         const gid = await ensureGameStarted(uid, true);
         if (gid) await flushPendingMoves(gid, uid);
         queueBotResponse(next, playerMetaForBot);
+        refreshProfile(uid);
       })();
 
       setStatus("starting");
@@ -476,18 +674,19 @@ export default function Home() {
         else recentBlundersRef.current = Math.max(0, recentBlundersRef.current - 1);
 
         queueBotResponse(next, { ...playerMetaForBot, quality: r.quality });
+        refreshProfile(uid);
       })
       .catch(async (e) => {
         const msg = String(e?.message || e);
         track("move_save_error", { message: msg });
 
-        // ✅ FK / stale gameId recovery after docker down -v
         if (msg.includes("P2003") || msg.includes("Move_gameId_fkey")) {
           sessionStorage.removeItem(gameKey(uid));
           setGameId(null);
           startedForUidRef.current = null;
 
           pendingMovesRef.current.push(payload);
+          setPendingCount(pendingMovesRef.current.length);
           track("move_requeued_after_fk", { uid, ply: payload.ply });
 
           const gid = await ensureGameStarted(uid, true);
@@ -495,6 +694,7 @@ export default function Home() {
         }
 
         queueBotResponse(next, playerMetaForBot);
+        refreshProfile(uid);
       })
       .finally(() => setStatus("ready"));
 
@@ -511,41 +711,136 @@ export default function Home() {
 
   function onMouseOverSquare(square) {
     track("hover", { square });
+
+    // hover burst tracker (10s window)
+    const now = Date.now();
+    const win = hoverBurstRef.current;
+
+    if (!win.windowStart || now - win.windowStart > 10000) {
+      win.windowStart = now;
+      win.count = 0;
+    }
+    win.count += 1;
   }
 
-  function useHint() {
-    track("hint_used", { kind: "nudge" });
-    alert("Hint: slow down and scan captures/checks first.");
+  function buildHintPayload(ch) {
+    const hb = hoverBurstRef.current.count;
+    const thinkTimeMs = performance.now() - thinkStartRef.current;
+
+    const behavioral = getBehavioralHint({
+      segment,
+      hoverBurst: hb,
+      thinkTimeMs
+    });
+
+    const tactical = getTacticalHint(ch);
+
+    return {
+      behavioral,
+      tactical,
+      segment,
+      hoverBurst: hb,
+      thinkTimeMs: Math.round(thinkTimeMs),
+      fen: ch.fen()
+    };
   }
 
-  // ✅ IMPORTANT: use STATE so board updates when bot stops thinking
+  function buildAndShowHint(ch, { silent = false } = {}) {
+    const data = buildHintPayload(chess instanceof Chess ? ch : chess);
+
+    setHintData(data);
+    setHintOpen(true);
+
+    if (!silent) {
+      track("hint_used", {
+        kind: "dynamic_panel",
+        segment: data.segment,
+        hoverBurst: data.hoverBurst,
+        thinkTimeMs: data.thinkTimeMs
+      });
+    }
+
+    refreshProfile(uid);
+  }
+
+  function toggleHint() {
+    if (hintOpen) {
+      setHintOpen(false);
+      return;
+    }
+    buildAndShowHint(chess);
+  }
+
   const draggable = !botThinking;
+
+  // stable derived UI values
+  const segmentBadge = useMemo(() => normalizeSegment(segment), [segment]);
 
   return (
     <div className="row" style={{ alignItems: "flex-start" }}>
-      <div className="card" style={{ flex: "0 0 420px" }}>
-        <Chessboard
-          position={chess.fen()}
-          onPieceDrop={onPieceDrop}
-          onSquareClick={onSquareClick}
-          onSquareRightClick={onSquareRightClick}
-          onMouseOverSquare={onMouseOverSquare}
-          arePiecesDraggable={draggable}
-        />
+      {/* LEFT */}
+<div className="card boardCard" style={{ flex: "0 0 420px" }}>
+  <div className="chessboard-safe">
+    <div className="chessboard-frame">
+      <Chessboard
+        position={chess.fen()}
+        onPieceDrop={onPieceDrop}
+        onSquareClick={onSquareClick}
+        onSquareRightClick={onSquareRightClick}
+        onMouseOverSquare={onMouseOverSquare}
+        arePiecesDraggable={draggable}
+        boardWidth={BOARD_WIDTH}
+      />
+    </div>
+  </div>
 
         <div className="row" style={{ marginTop: 12 }}>
           <button className="btn" onClick={resetGame}>
             New game (new UID)
           </button>
-          <button className="btn" onClick={useHint}>
-            Hint
+          <button className="btn btn-primary" onClick={toggleHint}>
+            {hintOpen ? "Hide hint" : "Hint"}
           </button>
         </div>
 
-        {nudge && (
-          <p className="small" style={{ marginTop: 10 }}>
-            🧠 Nudge: take 5 seconds before committing your move.
-          </p>
+        {/* ✅ HINT PANEL (no alert) */}
+        {hintOpen && hintData && (
+          <div className="hintBox">
+            <div
+              className="row"
+              style={{ justifyContent: "space-between", alignItems: "center" }}
+            >
+              <strong>Hint</strong>
+              <span className="badge">segment: {segmentBadge}</span>
+            </div>
+
+            <div style={{ marginTop: 10 }}>
+              <div className="small" style={{ opacity: 0.9, marginBottom: 6 }}>
+                Play tip
+              </div>
+              <div style={{ lineHeight: 1.35 }}>{hintData.behavioral}</div>
+            </div>
+
+            <div style={{ marginTop: 10 }}>
+              <div className="small" style={{ opacity: 0.9, marginBottom: 6 }}>
+                Position tip
+              </div>
+              <div style={{ lineHeight: 1.35 }}>{hintData.tactical}</div>
+            </div>
+
+            <div className="small" style={{ marginTop: 10, opacity: 0.7 }}>
+              signals: hoverBurst={hintData.hoverBurst} • thinkTime≈
+              {Math.round(hintData.thinkTimeMs / 100) / 10}s
+            </div>
+          </div>
+        )}
+
+        {/* ✅ dynamic nudge */}
+        {nudgeEnabled && nudge && (
+          <div className="nudgeBox">
+            <strong style={{ display: "block", marginBottom: 4 }}>Tip</strong>
+            {nudge.msg}
+          </div>
         )}
 
         <p className="small" style={{ marginTop: 10, opacity: 0.85 }}>
@@ -559,15 +854,11 @@ export default function Home() {
         )}
       </div>
 
+      {/* RIGHT */}
       <div className="card" style={{ flex: "1 1 420px" }}>
         <div className="row" style={{ justifyContent: "space-between" }}>
           <span
-            className="badge"
-            style={{
-              borderColor: uidFlash ? "#7CFFB2" : undefined,
-              boxShadow: uidFlash ? "0 0 0 2px rgba(124,255,178,0.25)" : "none",
-              transition: "all 250ms ease",
-            }}
+            className={`badge ${uidFlash ? "flash" : ""}`}
             title="Unique user identifier (per game/person)"
           >
             UID: {uid}
@@ -597,13 +888,27 @@ export default function Home() {
           Quality label: <span className="badge">{lastQuality ?? "—"}</span>
         </p>
 
+        <h3>Segment (live)</h3>
+        <p className="small">
+          segment: <span className="badge">{segmentBadge}</span>
+        </p>
+
+        {profileStats && (
+          <p className="small" style={{ opacity: 0.85 }}>
+            signals: avgThink={profileStats.avgThinkTime}s • blunderRate=
+            {profileStats.blunderRate}% • hovers={profileStats.hoverCount} • hovers/move=
+            {profileStats.hoversPerMove} • hints={profileStats.hintsUsed}
+          </p>
+        )}
+
         <h3>Influence toggles (from admin)</h3>
         <ul className="small">
           <li>
             confirmMoves: <b>{String(confirmMoves)}</b>
           </li>
           <li>
-            nudgeTakeASecond: <b>{String(nudge)}</b>
+            nudgeTakeASecond:{" "}
+            <b>{String(interventions.nudgeTakeASecond ?? "default-on")}</b>
           </li>
         </ul>
 
@@ -616,7 +921,7 @@ export default function Home() {
         </p>
 
         <p className="small" style={{ opacity: 0.75 }}>
-          Pending moves: <span className="badge">{pendingMovesRef.current.length}</span>
+          Pending moves: <span className="badge">{pendingCount}</span>
         </p>
       </div>
     </div>
