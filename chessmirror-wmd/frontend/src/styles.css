@@ -1,0 +1,551 @@
+/* =========================
+   ChessMirror WMD — Global UI
+   FIXED drop-in for src/styles.css
+   (includes: hintBox, chessboard wrap, flex scroll fixes, details marker fix)
+   ========================= */
+
+:root {
+  /* Typography */
+  font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+
+  /* Colors */
+  --bg: #0b0c10;
+  --panel: rgba(20, 21, 26, 0.82);
+  --panel-solid: #14151a;
+  --border: rgba(255, 255, 255, 0.10);
+  --border-strong: rgba(255, 255, 255, 0.16);
+  --text: rgba(255, 255, 255, 0.92);
+  --muted: rgba(255, 255, 255, 0.70);
+  --faint: rgba(255, 255, 255, 0.55);
+
+  /* Accents */
+  --accent: #7cffb2;
+  --accent2: #8aa7ff;
+  --danger: #ff7b7b;
+  --warning: #ffd37b;
+
+  /* Layout */
+  --radius: 16px;
+  --radius-sm: 12px;
+  --shadow: 0 14px 40px rgba(0, 0, 0, 0.45);
+  --shadow-soft: 0 10px 24px rgba(0, 0, 0, 0.35);
+
+  /* Focus ring */
+  --ring: 0 0 0 3px rgba(124, 255, 178, 0.22);
+
+  /* Motion */
+  --ease: cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+/* Subtle background glow */
+body {
+  margin: 0;
+  background:
+    radial-gradient(1200px 800px at 20% -10%, rgba(138, 167, 255, 0.18), transparent 60%),
+    radial-gradient(900px 700px at 90% 10%, rgba(124, 255, 178, 0.12), transparent 55%),
+    radial-gradient(900px 900px at 50% 120%, rgba(255, 211, 123, 0.08), transparent 55%),
+    var(--bg);
+  color: var(--text);
+}
+
+a { color: inherit; text-decoration: none; }
+* { box-sizing: border-box; }
+
+::selection { background: rgba(124, 255, 178, 0.25); }
+
+/* Container */
+.container {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 22px;
+}
+
+/* Headings polish */
+h2, h3, h4 { letter-spacing: -0.01em; }
+h2 { font-size: 22px; line-height: 1.2; }
+h3 { font-size: 16px; margin-bottom: 10px; }
+h4 { font-size: 14px; margin-bottom: 8px; }
+
+/* Layout row */
+.row {
+  display: flex;
+  gap: 14px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+/* Card */
+.card {
+  background: linear-gradient(180deg, rgba(20, 21, 26, 0.86), rgba(20, 21, 26, 0.76));
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 16px;
+  box-shadow: var(--shadow-soft);
+  backdrop-filter: blur(10px);
+}
+
+/* Divider */
+hr {
+  border: none;
+  border-top: 1px solid rgba(255, 255, 255, 0.10);
+  margin: 14px 0;
+}
+
+/* Text helpers */
+.small {
+  font-size: 12px;
+  opacity: 0.78;
+  color: var(--muted);
+  line-height: 1.45;
+}
+
+/* Badge */
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 10px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(15, 16, 22, 0.75);
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.86);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.22);
+}
+
+.badge.flash {
+  border-color: rgba(124, 255, 178, 0.65);
+  box-shadow: 0 0 0 2px rgba(124, 255, 178, 0.22), 0 10px 22px rgba(0, 0, 0, 0.35);
+}
+
+/* Inputs */
+.input {
+  background: rgba(15, 16, 22, 0.65);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  color: rgba(255, 255, 255, 0.90);
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  width: 100%;
+  outline: none;
+  transition: border-color 180ms var(--ease), box-shadow 180ms var(--ease), transform 180ms var(--ease);
+}
+
+.input:focus {
+  border-color: rgba(124, 255, 178, 0.55);
+  box-shadow: var(--ring);
+}
+
+/* Buttons */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: linear-gradient(180deg, rgba(35, 36, 58, 0.92), rgba(28, 29, 48, 0.92));
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  color: rgba(255, 255, 255, 0.92);
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  user-select: none;
+  transition:
+    transform 140ms var(--ease),
+    border-color 160ms var(--ease),
+    opacity 160ms var(--ease),
+    box-shadow 160ms var(--ease),
+    background 160ms var(--ease);
+  box-shadow: 0 10px 18px rgba(0, 0, 0, 0.28);
+}
+
+.btn:hover {
+  border-color: rgba(255, 255, 255, 0.22);
+  transform: translateY(-1px);
+}
+
+.btn:active {
+  transform: translateY(0px) scale(0.99);
+  opacity: 0.95;
+}
+
+.btn:focus-visible {
+  outline: none;
+  box-shadow: var(--ring), 0 10px 18px rgba(0, 0, 0, 0.28);
+}
+
+.btn[disabled] {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.btn-primary {
+  background: linear-gradient(180deg, rgba(124, 255, 178, 0.18), rgba(124, 255, 178, 0.10));
+  border-color: rgba(124, 255, 178, 0.35);
+}
+
+/* Tables */
+table { width: 100%; border-collapse: collapse; }
+td, th {
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  padding: 10px 8px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+/* Code blocks */
+pre {
+  margin: 0;
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  background: rgba(10, 11, 16, 0.55);
+  border: 1px solid rgba(255, 255, 255, 0.10);
+  color: rgba(255, 255, 255, 0.86);
+  overflow: auto;
+  line-height: 1.4;
+}
+
+/* Nice scrollbars (Chrome/Edge) */
+*::-webkit-scrollbar { height: 10px; width: 10px; }
+*::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.12);
+  border-radius: 999px;
+}
+*::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.18); }
+
+/* =========================================================
+   Chessboard: FIX drag offsets + stable sizing
+   - DO NOT apply transforms to any parent of Chessboard
+   - Keep wrap overflow visible, frame overflow hidden
+   ========================================================= */
+
+.chessboard-wrap {
+  width: 100%;
+  /* important: no transform / filter here */
+  overflow: visible;
+  position: relative;
+}
+
+.chessboard-frame {
+  width: 420px;              /* matches BOARD_WIDTH */
+  max-width: 100%;
+  margin: 0 auto;
+  border-radius: 18px;
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, 0.10);
+  box-shadow: 0 18px 42px rgba(0, 0, 0, 0.45);
+}
+
+/* react-chessboard internal images sometimes get pointer quirks */
+.chessboard-frame * {
+  user-select: none;
+}
+
+/* =========================================================
+   Hint + Nudge boxes (Home.jsx uses hintBox + nudgeBox)
+   ========================================================= */
+
+.hintBox {
+  margin-top: 10px;
+  padding: 12px 12px;
+  border-radius: 14px;
+  background: rgba(138, 167, 255, 0.07);
+  border: 1px solid rgba(138, 167, 255, 0.22);
+  box-shadow: 0 10px 24px rgba(0, 0, 0, 0.22);
+  animation: panelIn 220ms var(--ease) both;
+}
+
+.nudgeBox {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  font-size: 14px;
+  line-height: 1.3;
+  animation: panelIn 220ms var(--ease) both;
+}
+
+@keyframes panelIn {
+  from { transform: translateY(4px); opacity: 0; }
+  to   { transform: translateY(0); opacity: 1; }
+}
+
+/* =========================================================
+   Admin UI — classes used by updated Admin.jsx
+   (Fix: min-height:0 on flex children so scroll works)
+   ========================================================= */
+
+.adminGrid {
+  display: grid;
+  grid-template-columns: 380px 1fr;
+  gap: 14px;
+  align-items: start;
+}
+
+.adminUsers,
+.adminProfile {
+  height: calc(100vh - 120px);
+  min-height: 0; /* KEY FIX */
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+.adminShell {
+  max-width: 520px;
+  margin: 0 auto;
+}
+
+.adminHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.adminLogin {
+  display: grid;
+  grid-template-columns: 1fr 150px;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.adminSearch { margin-top: 12px; }
+
+.adminUserList {
+  margin-top: 12px;
+  overflow: auto;
+  padding-right: 6px;
+  flex: 1;
+  min-height: 0; /* KEY FIX */
+}
+
+.userItem {
+  width: 100%;
+  text-align: left;
+  border: 1px solid rgba(255, 255, 255, 0.10);
+  background: rgba(15, 16, 22, 0.35);
+  padding: 12px;
+  border-radius: 14px;
+  cursor: pointer;
+  transition: transform 140ms var(--ease), border-color 160ms var(--ease), background 160ms var(--ease);
+  margin-bottom: 10px;
+}
+
+.userItem:hover {
+  transform: translateY(-1px);
+  border-color: rgba(255, 255, 255, 0.18);
+  background: rgba(15, 16, 22, 0.45);
+}
+
+.userItem.active {
+  border-color: rgba(124, 255, 178, 0.35);
+  box-shadow: 0 0 0 2px rgba(124, 255, 178, 0.12);
+}
+
+.userTop {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+}
+
+.userMeta {
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--muted);
+  opacity: 0.9;
+  line-height: 1.35;
+}
+
+.emptyState { padding: 18px; }
+
+.statGrid {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.statCard {
+  border-radius: 14px;
+  border: 1px solid rgba(255, 255, 255, 0.10);
+  background: rgba(15, 16, 22, 0.35);
+  padding: 12px;
+}
+
+.statLabel {
+  font-size: 11px;
+  color: var(--muted);
+  opacity: 0.85;
+}
+
+.statValue {
+  margin-top: 6px;
+  font-size: 16px;
+  letter-spacing: -0.01em;
+  color: var(--text);
+}
+
+.chartBox {
+  width: 100%;
+  height: 240px;
+  border-radius: 14px;
+  border: 1px solid rgba(255, 255, 255, 0.10);
+  background: rgba(15, 16, 22, 0.28);
+  padding: 10px;
+}
+
+.toggleGrid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+
+.toggle {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  border-radius: 14px;
+  border: 1px solid rgba(255, 255, 255, 0.10);
+  background: rgba(15, 16, 22, 0.30);
+  padding: 12px;
+}
+
+.toggle input {
+  margin-top: 3px;
+  accent-color: var(--accent);
+}
+
+.toggleTitle {
+  font-size: 13px;
+  font-weight: 600;
+  color: rgba(255, 255, 255, 0.90);
+}
+
+.toggleDesc {
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--muted);
+  opacity: 0.9;
+  line-height: 1.35;
+}
+
+/* ===== Admin events list visibility fix ===== */
+.eventsList {
+  margin-top: 10px;
+  overflow: auto;
+  padding-right: 6px;
+  flex: 1;
+  min-height: 0; /* KEY FIX */
+  max-height: 320px; /* keeps it visible inside profile */
+}
+
+.eventItem {
+  border: 1px solid rgba(255,255,255,0.10);
+  background: rgba(15,16,22,0.35);
+  border-radius: 14px;
+  padding: 10px 12px;
+  margin-bottom: 10px;
+}
+
+.eventTop {
+  display: grid;
+  grid-template-columns: auto auto 1fr;
+  gap: 10px;
+  align-items: center;
+  cursor: pointer;
+  list-style: none;
+}
+
+/* Fix: details marker only applies to <summary>, not div */
+summary.eventTop::-webkit-details-marker { display: none; }
+summary.eventTop { list-style: none; }
+details > summary.eventTop { list-style: none; }
+
+.eventItem pre {
+  background: rgba(10, 11, 16, 0.55);
+  border: 1px solid rgba(255,255,255,0.10);
+  border-radius: 12px;
+  padding: 10px 12px;
+  overflow: auto;
+  white-space: pre-wrap;
+}
+
+/* Alerts */
+.alert {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 12px;
+  border-radius: 12px;
+  border: 1px solid rgba(124, 255, 178, 0.25);
+  background: rgba(124, 255, 178, 0.08);
+  color: rgba(255, 255, 255, 0.90);
+  font-size: 12px;
+  line-height: 1.3;
+}
+
+.alert-danger {
+  border-color: rgba(255, 123, 123, 0.35);
+  background: rgba(255, 123, 123, 0.10);
+}
+
+/* =========================================================
+   Responsive tweaks
+   ========================================================= */
+
+@media (max-width: 980px) {
+  .container { padding: 16px; }
+  .card { border-radius: 14px; }
+
+  .adminGrid { grid-template-columns: 1fr; }
+
+  .adminUsers,
+  .adminProfile {
+    height: auto;
+    min-height: unset;
+  }
+
+  .statGrid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .toggleGrid { grid-template-columns: 1fr; }
+}
+
+@media (max-width: 560px) {
+  .row { gap: 10px; }
+  .btn { width: 100%; justify-content: center; }
+  .adminLogin { grid-template-columns: 1fr; }
+}
+/* ================================
+   FIX: react-chessboard drag offset
+   Cause: backdrop-filter/transform/filter on ancestors
+   ================================ */
+
+/* Maak een safe layer specifiek voor het bord */
+.chessboard-safe {
+  /* kill everything that breaks pointer math */
+  transform: none !important;
+  filter: none !important;
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+  perspective: none !important;
+
+  /* prevent weird layout recalcs */
+  position: relative;
+  width: 420px;          /* match BOARD_WIDTH */
+  max-width: 100%;
+}
+
+/* bordframe zelf ook clean houden */
+.chessboard-safe .chessboard-frame {
+  transform: none !important;
+  filter: none !important;
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+  perspective: none !important;
+}
+
+/* heel belangrijk: de CARD die het bord bevat mag geen backdrop-filter hebben */
+.card.boardCard {
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+}
